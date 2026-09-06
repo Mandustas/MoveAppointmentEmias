@@ -99,17 +99,24 @@
       return;
     }
 
-    if (type === "PATIENT_DATA_RECEIVED" && payload) {
-      console.log("%c[EMIAS Assistant]%c Данные пациента и записей синхронизированы!", "background:#00897B;color:white;padding:2px 6px;border-radius:3px;", "color:#00897B;font-weight:bold;");
+    // Patient Context Sync
+    if (type === "PATIENT_CONTEXT_SYNC" && payload) {
+      const store = await chrome.storage.local.get("patientContext");
+      const merged = { ...(store.patientContext || {}), ...payload };
+      await chrome.storage.local.set({ patientContext: merged });
+    }
+
+    // Appointments Sync
+    if (type === "APPOINTMENTS_SYNC" && payload) {
       await chrome.storage.local.set({
-        patientContext: payload.patientContext,
         appointments: payload.appointments,
         lastAppointmentsSync: Date.now()
       });
       renderFloatingUi();
     }
 
-    if (type === "DOCTORS_INFO_RECEIVED" && payload) {
+    // Doctors Info Sync
+    if (type === "DOCTORS_INFO_SYNC" && payload) {
       const { appointmentId, doctorsInfo } = payload;
       const stored = await chrome.storage.local.get("doctorsInfoMap");
       const map = stored.doctorsInfoMap || {};
@@ -117,6 +124,7 @@
       await chrome.storage.local.set({ doctorsInfoMap: map });
     }
 
+    // Sniffer log
     if (type === "API_CAPTURED" && payload) {
       const store = await chrome.storage.local.get("capturedRequests");
       const list = store.capturedRequests || [];
@@ -134,46 +142,56 @@
   async function fetchAvailableSchedule(appointment, targetDateStr) {
     const store = await chrome.storage.local.get(["patientContext", "doctorsInfoMap", "monitoringConfig"]);
     const patientContext = store.patientContext;
-    if (!patientContext || !patientContext.omsNumber) {
-      throw new Error("Нет контекста пациента. Обновите страницу ЕМИАС.");
+    if (!patientContext || !patientContext.omsNumber || !patientContext.birthDate) {
+      throw new Error("Сессия не синхронизирована. Обновите страницу ЕМИАС (F5)");
     }
 
     const doctorsMap = store.doctorsInfoMap || {};
     const doctorsInfoList = doctorsMap[appointment.id] || [];
 
-    const targetD = new Date(targetDateStr);
-    const fromD = new Date(targetD);
-    fromD.setDate(fromD.getDate() - 1);
-    const toD = new Date(targetD);
-    toD.setDate(toD.getDate() + 3);
+    // Calculate dates safely
+    const now = new Date();
+    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
-    const dateFrom = fromD.toISOString().split("T")[0];
-    const dateTo = toD.toISOString().split("T")[0];
+    const cleanTargetDate = targetDateStr ? targetDateStr.split("T")[0] : todayStr;
+    const dateFrom = cleanTargetDate < todayStr ? todayStr : cleanTargetDate;
+
+    // Period: 7 days window starting from dateFrom
+    const fromObj = new Date(dateFrom + "T00:00:00");
+    const toObj = new Date(fromObj);
+    toObj.setDate(toObj.getDate() + 7);
+    const dateTo = `${toObj.getFullYear()}-${String(toObj.getMonth() + 1).padStart(2, '0')}-${String(toObj.getDate()).padStart(2, '0')}`;
 
     const resourcesToQuery = [];
 
+    // 1. Current appointment's resource
     resourcesToQuery.push({
-      availableResourceId: appointment.availableResourceId,
-      complexResourceId: appointment.complexResourceId,
-      lpuId: appointment.lpuId,
-      lpuName: appointment.nameLpu,
+      availableResourceId: Number(appointment.availableResourceId),
+      complexResourceId: Number(appointment.complexResourceId),
+      lpuId: Number(appointment.lpuId),
+      lpuName: appointment.nameLpu || "",
       name: appointment.roomNumber || ""
     });
 
+    // 2. Other resources ONLY if complexResourceId is known
     const config = store.monitoringConfig || {};
-    if (config.anyDoctor && doctorsInfoList.length > 0) {
+    if (config.anyDoctor && Array.isArray(doctorsInfoList) && doctorsInfoList.length > 0) {
       for (const doc of doctorsInfoList) {
         if (Array.isArray(doc.availableResources)) {
           for (const res of doc.availableResources) {
-            if (res.id !== appointment.availableResourceId) {
-              const compId = (res.complexResource && res.complexResource[0] && res.complexResource[0].id) || appointment.complexResourceId;
-              resourcesToQuery.push({
-                availableResourceId: res.id,
-                complexResourceId: compId,
-                lpuId: doc.lpuId,
-                lpuName: doc.lpuShortName || doc.defaultAddress,
-                name: res.name
-              });
+            const resId = Number(res.id);
+            if (resId !== Number(appointment.availableResourceId)) {
+              const crList = res.complexResource;
+              const compId = (Array.isArray(crList) && crList[0] && crList[0].id) ? Number(crList[0].id) : null;
+              if (compId) {
+                resourcesToQuery.push({
+                  availableResourceId: resId,
+                  complexResourceId: compId,
+                  lpuId: Number(doc.lpuId || res.lpuId),
+                  lpuName: doc.lpuShortName || doc.defaultAddress || "",
+                  name: res.name || ""
+                });
+              }
             }
           }
         }
@@ -185,12 +203,15 @@
     for (const resInfo of resourcesToQuery) {
       try {
         const payload = {
-          appointmentId: appointment.id,
-          availableResourceId: resInfo.availableResourceId,
-          complexResourceId: resInfo.complexResourceId,
-          omsNumber: patientContext.omsNumber,
-          birthDate: patientContext.birthDate,
-          period: { dateFrom, dateTo }
+          appointmentId: Number(appointment.id),
+          availableResourceId: Number(resInfo.availableResourceId),
+          complexResourceId: Number(resInfo.complexResourceId),
+          omsNumber: String(patientContext.omsNumber),
+          birthDate: String(patientContext.birthDate),
+          period: {
+            dateFrom: dateFrom,
+            dateTo: dateTo
+          }
         };
 
         const res = await executeBridgeCmd("CMD_GET_SCHEDULE", payload);
@@ -199,7 +220,7 @@
           allSlots = allSlots.concat(slots);
         }
       } catch (err) {
-        console.warn("[EMIAS] Ошибка получения расписания:", resInfo.availableResourceId, err);
+        console.warn("[EMIAS] Ошибка получения расписания ресурса:", resInfo.availableResourceId, err.message);
       }
     }
 
@@ -209,16 +230,18 @@
   async function performShift(appointment, targetSlot) {
     const store = await chrome.storage.local.get("patientContext");
     const patientContext = store.patientContext;
-    if (!patientContext) throw new Error("Нет контекста пациента");
+    if (!patientContext || !patientContext.omsNumber || !patientContext.birthDate) {
+      throw new Error("Нет данных сессии пациента");
+    }
 
     const payload = {
-      appointmentId: appointment.id,
-      availableResourceId: targetSlot.availableResourceId || appointment.availableResourceId,
-      complexResourceId: targetSlot.complexResourceId || appointment.complexResourceId,
+      appointmentId: Number(appointment.id),
+      availableResourceId: Number(targetSlot.availableResourceId || appointment.availableResourceId),
+      complexResourceId: Number(targetSlot.complexResourceId || appointment.complexResourceId),
       startTime: targetSlot.startTime,
       endTime: targetSlot.endTime,
-      omsNumber: patientContext.omsNumber,
-      birthDate: patientContext.birthDate
+      omsNumber: String(patientContext.omsNumber),
+      birthDate: String(patientContext.birthDate)
     };
 
     console.log("[EMIAS Assistant] Отправка запроса на сдвиг записи:", payload);
@@ -255,7 +278,6 @@
             // Handle callback_query (inline buttons)
             if (u.callback_query) {
               const cb = u.callback_query;
-              const data = cb.data;
               const fromId = String(cb.from?.id || "");
               const targetChatId = String(store.tgChatId || "");
 
@@ -367,7 +389,7 @@
     const config = store.monitoringConfig;
     const appointments = store.appointments || [];
     const appointment = appointments.find(a => String(a.id) === String(config.appointmentId)) || appointments[0];
-    const transferMode = store.transferMode || "semi"; // "semi" by default
+    const transferMode = store.transferMode || "semi";
 
     if (!appointment) {
       await addLog("⚠️ Запись для переноса не найдена в списке активных", "error");
@@ -383,7 +405,7 @@
     updateStatusUi(`Проверка №${checkCount}... Запрос расписания`);
 
     try {
-      const targetDateStr = config.targetDatetime.split("T")[0];
+      const targetDateStr = config.targetDatetime ? config.targetDatetime.split("T")[0] : "";
       const slots = await fetchAvailableSchedule(appointment, targetDateStr);
 
       const matched = findBestSlots(slots, config.targetDatetime, {
@@ -419,8 +441,6 @@
           };
 
           await TelegramBot.sendMessage(store.tgToken, store.tgChatId, promptText, { replyMarkup: keyboard });
-
-          // Wait for user interaction or re-check after 90 seconds
           scheduleNextCycle(90);
           return;
         }
@@ -562,7 +582,6 @@
     const hasAppointments = appointments.length > 0;
     const transferMode = store.transferMode || "semi";
 
-    // Selected appointment for rich card
     const selectedApptId = store.monitoringConfig?.appointmentId || (appointments[0] ? appointments[0].id : null);
     const currentAppt = appointments.find(a => String(a.id) === String(selectedApptId)) || appointments[0] || null;
 

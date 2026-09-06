@@ -62,19 +62,26 @@
   function handleSpecializedApi(url, reqBody, resData) {
     if (!resData || !resData.payload) return;
 
-    // 1. Captured Active Appointments
-    if (url.includes("getAppointmentReceptionsByPatient")) {
-      const patientContext = {
-        omsNumber: reqBody?.omsNumber || null,
-        birthDate: reqBody?.birthDate || null,
-        patientId: reqBody?.patientId || null
-      };
-      const appointments = resData.payload.appointment || [];
-
+    // Whenever ANY /api-eip/ call has omsNumber and birthDate, capture patientContext!
+    if (reqBody && reqBody.omsNumber && reqBody.birthDate) {
       window.postMessage({
         source: "EMIAS_INTERCEPTOR",
-        type: "PATIENT_DATA_RECEIVED",
-        payload: { patientContext, appointments }
+        type: "PATIENT_CONTEXT_SYNC",
+        payload: {
+          omsNumber: String(reqBody.omsNumber),
+          birthDate: String(reqBody.birthDate),
+          patientId: reqBody.patientId ? String(reqBody.patientId) : null
+        }
+      }, "*");
+    }
+
+    // 1. Captured Active Appointments
+    if (url.includes("getAppointmentReceptionsByPatient")) {
+      const appointments = resData.payload.appointment || [];
+      window.postMessage({
+        source: "EMIAS_INTERCEPTOR",
+        type: "APPOINTMENTS_SYNC",
+        payload: { appointments }
       }, "*");
     }
 
@@ -85,7 +92,7 @@
 
       window.postMessage({
         source: "EMIAS_INTERCEPTOR",
-        type: "DOCTORS_INFO_RECEIVED",
+        type: "DOCTORS_INFO_SYNC",
         payload: { appointmentId, doctorsInfo }
       }, "*");
     }
@@ -219,13 +226,29 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
         });
-        const data = await res.json();
+
+        let data = null;
+        try {
+          data = await res.json();
+        } catch (e) {
+          data = await res.text();
+        }
+
+        if (!res.ok) {
+          console.error("%c[EMIAS 400 ERROR]%c", "background:#dc2626;color:white;font-weight:bold;padding:2px 6px;border-radius:3px;", "color:#dc2626;font-weight:bold;", {
+            status: res.status,
+            errorData: data,
+            sentPayload: payload
+          });
+        }
+
         window.postMessage({
           source: "EMIAS_INTERCEPTOR",
           action: "RES_GET_SCHEDULE",
           reqId,
           status: res.status,
-          data
+          data: res.ok ? data : null,
+          error: res.ok ? null : (data?.message || data?.error?.message || `Ошибка сервера ${res.status}`)
         }, "*");
       } else if (action === "CMD_GET_DOCTORS_FOR_LI") {
         const res = await originalFetch("/api-eip/v4/saOrchestrator/getDoctorsInfoForLI", {
