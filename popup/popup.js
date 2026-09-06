@@ -142,9 +142,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     cardApptNum.textContent = appt.number || "АКТИВНАЯ ЗАПИСЬ";
     cardApptBranchShort.textContent = appt.nameLpu ? (appt.nameLpu.split(" ").slice(-2).join(" ")) : "";
     cardApptTitle.textContent = `🩺 ${appt.toBM ? appt.toBM.name : (appt.specialityName || "Приём врача")}`;
-
-    const start = new Date(appt.startTime);
-    cardApptTime.textContent = `📅 ${start.toLocaleDateString("ru-RU", { day: "2-digit", month: "long", year: "numeric" })} в ${start.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
+    cardApptTime.textContent = `📅 ${formatDateTimeNice(appt.startTime)}`;
     cardApptLpu.textContent = `📍 ${appt.nameLpu || "Поликлиника"} (${appt.roomNumber || ""})`;
   }
 
@@ -164,9 +162,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     cachedAppointments.forEach((a, idx) => {
       const opt = document.createElement("option");
       opt.value = a.id;
-      const start = new Date(a.startTime);
-      const dateStr = start.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" });
-      const timeStr = start.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+      const dateStr = formatDate(a.startTime);
+      const timeStr = formatTime(a.startTime);
       const title = a.toBM ? a.toBM.name : (a.specialityName || "Приём");
       opt.textContent = `Запись #${idx + 1} (${title} · ${dateStr} ${timeStr})`;
       apptSelect.appendChild(opt);
@@ -236,35 +233,9 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
     }
 
-    const branchesMap = new Map();
+    const branches = extractBranches(selectedAppt, doctorsList);
 
-    // 1. Current appointment branch
-    if (selectedAppt.lpuId) {
-      const curLpuId = String(selectedAppt.lpuId);
-      branchesMap.set(curLpuId, {
-        lpuId: curLpuId,
-        name: selectedAppt.nameLpu || `Филиал #${curLpuId}`,
-        address: selectedAppt.lpuAddress || selectedAppt.address || "",
-        isCurrent: true
-      });
-    }
-
-    // 2. Discovered branches from doctorsInfoList
-    if (Array.isArray(doctorsList)) {
-      for (const doc of doctorsList) {
-        const lpuId = String(doc.lpuId || (doc.availableResources && doc.availableResources[0] && doc.availableResources[0].lpuId) || "");
-        if (!lpuId) continue;
-        const existing = branchesMap.get(lpuId) || {};
-        branchesMap.set(lpuId, {
-          lpuId,
-          name: doc.lpuShortName || existing.name || `Филиал #${lpuId}`,
-          address: doc.defaultAddress || existing.address || "",
-          isCurrent: existing.isCurrent || (String(selectedAppt.lpuId) === lpuId)
-        });
-      }
-    }
-
-    if (branchesMap.size === 0) {
+    if (branches.length === 0) {
       branchList.innerHTML = `
         <div class="branch-empty">
           <div>Филиалы не определены</div>
@@ -275,9 +246,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     const savedAllowed = store.monitoringConfig?.allowedLpuIds;
+    const fragment = document.createDocumentFragment();
 
-    branchList.innerHTML = "";
-    branchesMap.forEach(b => {
+    branches.forEach(b => {
       const isChecked = Array.isArray(savedAllowed)
         ? savedAllowed.map(String).includes(b.lpuId)
         : true;
@@ -300,8 +271,11 @@ document.addEventListener("DOMContentLoaded", async () => {
         await saveCurrentAllowedLpus();
       });
 
-      branchList.appendChild(item);
+      fragment.appendChild(item);
     });
+
+    branchList.innerHTML = "";
+    branchList.appendChild(fragment);
   }
 
   function getSelectedLpuIds() {
@@ -457,6 +431,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         slotsList.innerHTML = `<div style="color:#64748b;text-align:center;padding:10px;">На эту дату подходящих слотов не найдено (проверено: ${response.totalSlots}). Запустите автоперенос для ожидания отмен.</div>`;
       } else {
         slotsList.innerHTML = "";
+        const fragment = document.createDocumentFragment();
         matched.slice(0, 6).forEach(slot => {
           const card = document.createElement("div");
           card.className = "slot-card";
@@ -495,8 +470,9 @@ document.addEventListener("DOMContentLoaded", async () => {
             }
           });
 
-          slotsList.appendChild(card);
+          fragment.appendChild(card);
         });
+        slotsList.appendChild(fragment);
       }
     } catch (err) {
       slotsList.innerHTML = `<div style="color:#dc2626;padding:8px;">Ошибка связи: ${err.message}. Убедитесь, что вкладка ЕМИАС открыта.</div>`;

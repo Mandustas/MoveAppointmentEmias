@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ЕМИАС Автоперенос записи",
-  "version": "1.2.0",
+  "version": "1.2.2",
   "description": "Умный поиск слотов и полуавтоматический перенос записи к врачу на emias.info с подтверждением в Telegram",
   "permissions": [
     "storage",

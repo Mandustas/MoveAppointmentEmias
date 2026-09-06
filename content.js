@@ -1,17 +1,37 @@
 // Content Script (Isolated World) with Semi-Auto Telegram Support
 (() => {
-  let capturedCount = 0;
-  let monitoringTimer = null;
-  let countdownTimer = null;
-  let nextCheckTimestamp = 0;
-  let isTgPollingActive = false;
-  let lastTgUpdateId = 0;
-  let pendingSlotToShift = null;
+  // Centralized monitoring state
+  const MonitorState = {
+    capturedCount: 0,
+    monitoringTimer: null,
+    countdownTimer: null,
+    nextCheckTimestamp: 0,
+    isTgPollingActive: false,
+    lastTgUpdateId: 0,
+    pendingSlotToShift: null
+  };
+
+  // Safe timer disposal
+  function cleanupTimers() {
+    if (MonitorState.monitoringTimer) {
+      clearTimeout(MonitorState.monitoringTimer);
+      MonitorState.monitoringTimer = null;
+    }
+    if (MonitorState.countdownTimer) {
+      clearInterval(MonitorState.countdownTimer);
+      MonitorState.countdownTimer = null;
+    }
+  }
 
   // Sound chime synthesizer (Web Audio API)
   function playSuccessChime() {
     try {
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      const audioCtx = new AudioContextClass();
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
       const notes = [523.25, 659.25, 783.99, 1046.50];
       notes.forEach((freq, idx) => {
         const osc = audioCtx.createOscillator();
@@ -140,45 +160,98 @@
       list.push(payload);
       if (list.length > 60) list.shift();
       await chrome.storage.local.set({ capturedRequests: list });
-      capturedCount = list.length;
-      updateFloatingCounter(capturedCount);
+      MonitorState.capturedCount = list.length;
+      updateFloatingCounter(MonitorState.capturedCount);
     }
   });
+
+  // -------------------------------------------------------------
+  // Helpers: Appointments Sync & Resilient Doctors List
+  // -------------------------------------------------------------
+  async function refreshAppointmentsAfterShift() {
+    try {
+      const patientStore = await chrome.storage.local.get("patientContext");
+      const pCtx = patientStore.patientContext;
+      if (pCtx) {
+        const refreshed = await executeBridgeCmd("CMD_REFRESH_APPOINTMENTS", {
+          omsNumber: String(pCtx.omsNumber),
+          birthDate: String(pCtx.birthDate),
+          patientId: pCtx.patientId ? String(pCtx.patientId) : null
+        });
+        if (refreshed && refreshed.payload && refreshed.payload.appointment) {
+          await chrome.storage.local.set({
+            appointments: refreshed.payload.appointment,
+            lastAppointmentsSync: Date.now()
+          });
+          renderFloatingUi();
+        }
+      }
+    } catch (e) {
+      console.warn("[EMIAS] Не удалось синхронизировать записи после переноса:", e);
+    }
+  }
+
+  async function getResilientDoctorsList(appointment, queryBridgeIfMissing = false) {
+    const store = await chrome.storage.local.get(["doctorsInfoMap", "capturedRequests", "patientContext", "eiToken"]);
+    const doctorsMap = store.doctorsInfoMap || {};
+    let list = (appointment && (doctorsMap[appointment.id] || doctorsMap[String(appointment.id)])) || doctorsMap["last"] || null;
+
+    if (!list || !Array.isArray(list) || list.length === 0) {
+      const allLists = Object.values(doctorsMap).filter(v => Array.isArray(v) && v.length > 0);
+      if (allLists.length > 0) {
+        list = allLists[allLists.length - 1];
+      }
+    }
+
+    if (!list || !Array.isArray(list) || list.length === 0) {
+      const reqs = store.capturedRequests || [];
+      const docReq = reqs.slice().reverse().find(r => r.url && (r.url.includes("getDoctorsInfoForLI") || r.url.includes("getDoctorsInfo")) && r.responseBody?.payload?.doctorsInfo);
+      if (docReq && Array.isArray(docReq.responseBody.payload.doctorsInfo)) {
+        list = docReq.responseBody.payload.doctorsInfo;
+      }
+    }
+
+    if ((!list || !Array.isArray(list) || list.length === 0) && queryBridgeIfMissing && appointment) {
+      const pCtx = store.patientContext;
+      if (pCtx) {
+        const isBM = Boolean(appointment.toBM || appointment.type === "BM");
+        const res = await executeBridgeCmd("CMD_GET_DOCTORS_INFO", {
+          appointmentId: Number(appointment.id),
+          lpuId: Number(appointment.lpuId || 10000367),
+          isBM,
+          samplingTypeId: appointment.toBM?.id || 1,
+          omsNumber: String(pCtx.omsNumber),
+          birthDate: String(pCtx.birthDate),
+          eiToken: store.eiToken || null
+        });
+        if (res && res.payload && Array.isArray(res.payload.doctorsInfo)) {
+          list = res.payload.doctorsInfo;
+          doctorsMap[appointment.id] = list;
+          doctorsMap[String(appointment.id)] = list;
+          doctorsMap["last"] = list;
+          await chrome.storage.local.set({ doctorsInfoMap: doctorsMap });
+        }
+      }
+    }
+
+    return Array.isArray(list) ? list : [];
+  }
 
   // -------------------------------------------------------------
   // Schedule & Shift API
   // -------------------------------------------------------------
   async function fetchAvailableSchedule(appointment, targetDateStr, configOverride = null) {
-    const store = await chrome.storage.local.get(["patientContext", "doctorsInfoMap", "monitoringConfig", "eiToken", "capturedRequests"]);
+    const store = await chrome.storage.local.get(["patientContext", "monitoringConfig", "eiToken"]);
     const patientContext = store.patientContext;
     if (!patientContext || !patientContext.omsNumber || !patientContext.birthDate) {
       throw new Error("Сессия не синхронизирована. Обновите страницу ЕМИАС (F5)");
     }
 
-    const doctorsMap = store.doctorsInfoMap || {};
-    let doctorsInfoList = doctorsMap[appointment.id] || doctorsMap[String(appointment.id)] || doctorsMap["last"] || null;
-
-    if (!doctorsInfoList || !Array.isArray(doctorsInfoList) || doctorsInfoList.length === 0) {
-      const allLists = Object.values(doctorsMap).filter(v => Array.isArray(v) && v.length > 0);
-      if (allLists.length > 0) {
-        doctorsInfoList = allLists[allLists.length - 1];
-      }
-    }
-
-    if (!doctorsInfoList || !Array.isArray(doctorsInfoList) || doctorsInfoList.length === 0) {
-      const reqs = store.capturedRequests || [];
-      const docReq = reqs.slice().reverse().find(r => r.url && (r.url.includes("getDoctorsInfoForLI") || r.url.includes("getDoctorsInfo")) && r.responseBody?.payload?.doctorsInfo);
-      if (docReq && Array.isArray(docReq.responseBody.payload.doctorsInfo)) {
-        doctorsInfoList = docReq.responseBody.payload.doctorsInfo;
-      }
-    }
-
-    if (!Array.isArray(doctorsInfoList)) doctorsInfoList = [];
+    const doctorsInfoList = await getResilientDoctorsList(appointment, false);
 
     // Calculate dates: EMIAS mandates that dateFrom MUST ALWAYS BE today!
     // Querying with dateFrom in the future causes SA_REFERRAL_FOR_FUTURE (HTTP 400).
-    const now = new Date();
-    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const todayStr = getTodayDateStr();
     const dateFrom = todayStr;
 
     // Period: 7 days window starting from today (matches official EMIAS web portal)
@@ -195,7 +268,7 @@
         toObj.setTime(fromObj.getTime() + Math.min(diffDays + 2, 14) * 86400000);
       }
     }
-    const dateTo = `${toObj.getFullYear()}-${String(toObj.getMonth() + 1).padStart(2, '0')}-${String(toObj.getDate()).padStart(2, '0')}`;
+    const dateTo = formatIsoDate(toObj);
 
     const allCandidateResources = [];
 
@@ -303,24 +376,90 @@
   }
 
   // -------------------------------------------------------------
+  // Telegram Message Builders
+  // -------------------------------------------------------------
+  function buildTelegramConfirmationPrompt(appointment, bestSlot) {
+    const apptName = appointment?.toBM ? appointment.toBM.name : (appointment?.specialityName || "Приём");
+    const apptNum = appointment?.number ? ` (${appointment.number})` : "";
+    const shortBranch = bestSlot.lpuName ? (bestSlot.lpuName.replace(/ГБУЗ|ДЗМ/gi, '').trim().split(" ").slice(-2).join(" ")) : "";
+    const btnLabel = shortBranch ? `✅ Перенести на ${bestSlot.formattedTime} (${shortBranch})` : `✅ Перенести на ${bestSlot.formattedTime}`;
+
+    const text = `🔔 *Найден подходящий талон в ЕМИАС!*\n\n` +
+      `📋 *Процедура:* ${apptName}${apptNum}\n` +
+      `🏥 *Филиал / Адрес:* *${bestSlot.lpuName}*\n` +
+      `🩺 *Кабинет/Врач:* ${bestSlot.doctorName || bestSlot.cabinet || "Кабинет"}\n` +
+      `🕒 *Новое время:* *${bestSlot.formattedFull}*\n` +
+      `⏱️ *Отклонение:* ${bestSlot.absDiffMinutes} мин. от цели\n\n` +
+      `Подтвердите перенос нажатием кнопки на телефоне:`;
+
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: btnLabel, callback_data: "shift_confirm" }],
+        [{ text: "❌ Пропустить этот слот", callback_data: "shift_skip" }],
+        [{ text: "⏹️ Прекратить поиск", callback_data: "shift_stop" }]
+      ]
+    };
+
+    return { text, keyboard };
+  }
+
+  function buildTelegramSuccessMessage(appointment, targetSlot) {
+    const apptNum = appointment?.number ? `\n📋 Номер: ${appointment.number}` : "";
+    return `🎉 *Запись успешно перенесена!*${apptNum}\n\n` +
+      `🕒 Новое время: *${targetSlot.formattedFull}*\n` +
+      `🩺 Врач/Кабинет: ${targetSlot.doctorName || targetSlot.cabinet || "Кабинет"}\n` +
+      `🏥 Место: ${targetSlot.lpuName}`;
+  }
+
+  function buildTelegramStatusMessage(appointment, monitoringConfig, monitoringActive) {
+    const apptName = appointment?.toBM ? appointment.toBM.name : (appointment?.specialityName || "Приём");
+    const target = monitoringConfig?.targetDatetime ? new Date(monitoringConfig.targetDatetime).toLocaleString("ru-RU") : "не указана";
+
+    return `📊 *Текущий статус мониторинга:*\n\n` +
+      `🔘 *Состояние:* ${monitoringActive ? "🟢 Активен (поиск слотов)" : "⏹️ Остановлен"}\n` +
+      `📋 *Запись:* ${apptName} (${appointment?.number || ""})\n` +
+      `📅 *Текущий приём:* ${appointment?.startTime ? new Date(appointment.startTime).toLocaleString("ru-RU") : ""}\n` +
+      `🏥 *Филиал:* ${appointment?.nameLpu || ""}\n` +
+      `🎯 *Цель переноса:* ${target}\n` +
+      `🔄 *Проверок выполнено:* ${monitoringConfig?.checkCount || 0}\n` +
+      `⏳ *Последняя проверка:* ${monitoringConfig?.lastCheckTime || "только что"}`;
+  }
+
+  function buildTelegramStartMessage(appointment, targetDatetime, modeLabel) {
+    const apptName = appointment?.toBM ? appointment.toBM.name : (appointment?.specialityName || "Приём");
+    return `🚀 *Мониторинг ЕМИАС запущен!*\n\n` +
+      `📋 *Запись:* ${apptName}\n` +
+      `🎯 *Целевое время:* ${new Date(targetDatetime).toLocaleString("ru-RU")}\n` +
+      `⚙️ *Режим:* ${modeLabel}\n\n` +
+      `Вы можете остановить поиск или запросить статус кнопками ниже:`;
+  }
+
+  // -------------------------------------------------------------
   // Telegram 2-Way Bot Polling (/stop, /status, inline confirm)
   // -------------------------------------------------------------
   async function startTelegramPoller() {
-    if (isTgPollingActive) return;
-    isTgPollingActive = true;
+    if (MonitorState.isTgPollingActive) return;
+    MonitorState.isTgPollingActive = true;
 
-    while (isTgPollingActive) {
+    // Restore lastTgUpdateId from persistent storage if available
+    const initStore = await chrome.storage.local.get("lastTgUpdateId");
+    if (initStore.lastTgUpdateId) {
+      MonitorState.lastTgUpdateId = Math.max(MonitorState.lastTgUpdateId, initStore.lastTgUpdateId);
+    }
+
+    while (MonitorState.isTgPollingActive) {
       try {
         const store = await chrome.storage.local.get(["monitoringActive", "tgToken", "tgChatId", "monitoringConfig", "appointments"]);
         if (!store.tgToken) {
-          isTgPollingActive = false;
+          MonitorState.isTgPollingActive = false;
           break;
         }
 
-        const updates = await TelegramBot.getUpdates(store.tgToken, lastTgUpdateId + 1, 10);
+        const updates = await TelegramBot.getUpdates(store.tgToken, MonitorState.lastTgUpdateId + 1, 10);
         if (Array.isArray(updates) && updates.length > 0) {
           for (const u of updates) {
-            lastTgUpdateId = Math.max(lastTgUpdateId, u.update_id);
+            MonitorState.lastTgUpdateId = Math.max(MonitorState.lastTgUpdateId, u.update_id);
+            await chrome.storage.local.set({ lastTgUpdateId: MonitorState.lastTgUpdateId });
 
             // Handle callback_query (inline buttons)
             if (u.callback_query) {
@@ -370,17 +509,7 @@
       });
     } else if (cmdText === "/status" || cmdText.includes("Статус") || cmdText.includes("статус")) {
       const appt = appointments?.find(a => String(a.id) === String(monitoringConfig?.appointmentId)) || appointments?.[0];
-      const apptName = appt?.toBM ? appt.toBM.name : (appt?.specialityName || "Приём");
-      const target = monitoringConfig?.targetDatetime ? new Date(monitoringConfig.targetDatetime).toLocaleString("ru-RU") : "не указана";
-
-      const statusMsg = `📊 *Текущий статус мониторинга:*\n\n` +
-        `🔘 *Состояние:* ${monitoringActive ? "🟢 Активен (поиск слотов)" : "⏹️ Остановлен"}\n` +
-        `📋 *Запись:* ${apptName} (${appt?.number || ""})\n` +
-        `📅 *Текущий приём:* ${appt?.startTime ? new Date(appt.startTime).toLocaleString("ru-RU") : ""}\n` +
-        `🏥 *Филиал:* ${appt?.nameLpu || ""}\n` +
-        `🎯 *Цель переноса:* ${target}\n` +
-        `🔄 *Проверок выполнено:* ${monitoringConfig?.checkCount || 0}\n` +
-        `⏳ *Последняя проверка:* ${monitoringConfig?.lastCheckTime || "только что"}`;
+      const statusMsg = buildTelegramStatusMessage(appt, monitoringConfig, monitoringActive);
 
       await TelegramBot.sendMessage(tgToken, tgChatId, statusMsg, {
         replyMarkup: {
@@ -404,13 +533,13 @@
     if (action === "shift_confirm") {
       await TelegramBot.answerCallbackQuery(tgToken, cb.id, "Выполняется бронирование слота...");
 
-      if (!pendingSlotToShift) {
+      if (!MonitorState.pendingSlotToShift) {
         await TelegramBot.editMessageText(tgToken, tgChatId, msgId, "⚠️ Время ожидания подтверждения истекло или слот не найден. Мониторинг продолжается.");
         return;
       }
 
       // Keep targetSlot safe before stopMonitoring() clears pendingSlotToShift!
-      const targetSlot = { ...pendingSlotToShift };
+      const targetSlot = { ...MonitorState.pendingSlotToShift };
 
       await TelegramBot.editMessageText(tgToken, tgChatId, msgId, `⏳ Бронируем слот: *${targetSlot.formattedFull}* (${targetSlot.lpuName})...`);
 
@@ -421,47 +550,28 @@
         await stopMonitoring();
 
         // Refresh active appointments from EMIAS server so popup and page show the new appointment!
-        try {
-          const patientStore = await chrome.storage.local.get("patientContext");
-          const pCtx = patientStore.patientContext;
-          if (pCtx) {
-            const refreshed = await executeBridgeCmd("CMD_REFRESH_APPOINTMENTS", {
-              omsNumber: String(pCtx.omsNumber),
-              birthDate: String(pCtx.birthDate),
-              patientId: pCtx.patientId ? String(pCtx.patientId) : null
-            });
-            if (refreshed && refreshed.payload && refreshed.payload.appointment) {
-              await chrome.storage.local.set({
-                appointments: refreshed.payload.appointment,
-                lastAppointmentsSync: Date.now()
-              });
-              renderFloatingUi();
-            }
-          }
-        } catch (e) {
-          console.warn("[EMIAS] Не удалось синхронизировать записи после переноса:", e);
-        }
+        await refreshAppointmentsAfterShift();
 
         await addLog(`🎉 Успешно перенесено на ${targetSlot.formattedFull} (${targetSlot.lpuName})!`, "success");
-        await TelegramBot.editMessageText(tgToken, tgChatId, msgId, `🎉 *Запись успешно перенесена!*\n\n🕒 Новое время: *${targetSlot.formattedFull}*\n🩺 Врач/Кабинет: ${targetSlot.doctorName || targetSlot.cabinet}\n🏥 Место: ${targetSlot.lpuName}`);
-        pendingSlotToShift = null;
+        await TelegramBot.editMessageText(tgToken, tgChatId, msgId, buildTelegramSuccessMessage(appt, targetSlot));
+        MonitorState.pendingSlotToShift = null;
       } catch (err) {
         await addLog(`⚠️ Ошибка бронирования: ${err.message}`, "error");
         await TelegramBot.editMessageText(tgToken, tgChatId, msgId, `⚠️ *Слот не удалось занять*: ${err.message}.\nПродолжаю поиск других слотов...`);
-        pendingSlotToShift = null;
+        MonitorState.pendingSlotToShift = null;
         scheduleNextCycle(10);
       }
     } else if (action === "shift_skip") {
       await TelegramBot.answerCallbackQuery(tgToken, cb.id, "Слот пропущен");
       await TelegramBot.editMessageText(tgToken, tgChatId, msgId, "❌ Слот пропущен. Продолжаем поиск подходящего времени...");
-      pendingSlotToShift = null;
+      MonitorState.pendingSlotToShift = null;
       scheduleNextCycle(10);
     } else if (action === "shift_stop") {
       await TelegramBot.answerCallbackQuery(tgToken, cb.id, "Мониторинг остановлен");
       await stopMonitoring();
       await addLog("⏹️ Мониторинг остановлен из Telegram", "stop");
       await TelegramBot.editMessageText(tgToken, tgChatId, msgId, "⏹️ Мониторинг остановлен.");
-      pendingSlotToShift = null;
+      MonitorState.pendingSlotToShift = null;
     }
   }
 
@@ -509,29 +619,11 @@
 
         // 1. SEMI-AUTO MODE (Default): Ask via interactive Telegram button
         if (transferMode === "semi" && store.tgToken && store.tgChatId) {
-          pendingSlotToShift = bestSlot;
+          MonitorState.pendingSlotToShift = bestSlot;
           await addLog(`🎯 Найден слот ${bestSlot.formattedFull} (Δ ${bestSlot.absDiffMinutes} мин). Запрос подтверждения отправлен в Telegram`, "match");
           updateStatusUi(`🎯 Найден слот ${bestSlot.formattedTime}! Ожидание подтверждения в Telegram...`);
 
-          const shortBranch = bestSlot.lpuName ? (bestSlot.lpuName.replace(/ГБУЗ|ДЗМ/gi, '').trim().split(" ").slice(-2).join(" ")) : "";
-          const btnLabel = shortBranch ? `✅ Перенести на ${bestSlot.formattedTime} (${shortBranch})` : `✅ Перенести на ${bestSlot.formattedTime}`;
-
-          const promptText = `🔔 *Найден подходящий талон в ЕМИАС!*\n\n` +
-            `📋 *Процедура:* ${appointment.toBM ? appointment.toBM.name : (appointment.specialityName || "Приём")} (${appointment.number || ""})\n` +
-            `🏥 *Филиал / Адрес:* *${bestSlot.lpuName}*\n` +
-            `🩺 *Кабинет/Врач:* ${bestSlot.doctorName || bestSlot.cabinet || "Кабинет"}\n` +
-            `🕒 *Новое время:* *${bestSlot.formattedFull}*\n` +
-            `⏱️ *Отклонение:* ${bestSlot.absDiffMinutes} мин. от цели\n\n` +
-            `Подтвердите перенос нажатием кнопки на телефоне:`;
-
-          const keyboard = {
-            inline_keyboard: [
-              [{ text: btnLabel, callback_data: "shift_confirm" }],
-              [{ text: "❌ Пропустить этот слот", callback_data: "shift_skip" }],
-              [{ text: "⏹️ Прекратить поиск", callback_data: "shift_stop" }]
-            ]
-          };
-
+          const { text: promptText, keyboard } = buildTelegramConfirmationPrompt(appointment, bestSlot);
           await TelegramBot.sendMessage(store.tgToken, store.tgChatId, promptText, { replyMarkup: keyboard });
           scheduleNextCycle(90);
           return;
@@ -543,14 +635,13 @@
           await performShift(appointment, bestSlot);
           playSuccessChime();
           await stopMonitoring();
+          await refreshAppointmentsAfterShift();
 
           await addLog(`🎉 Успешно перенесено на ${bestSlot.formattedFull}!`, "success");
           updateStatusUi(`🎉 Запись перенесена на ${bestSlot.formattedFull}!`, true);
 
           if (store.tgToken && store.tgChatId) {
-            await TelegramBot.sendMessage(store.tgToken, store.tgChatId,
-              `🎉 *Запись успешно перенесена!*\n\n📋 Номер: ${appointment.number || ""}\n🩺 Врач/Кабинет: ${bestSlot.doctorName || bestSlot.cabinet || ""}\n🏥 Место: ${bestSlot.lpuName}\n🕒 Время: *${bestSlot.formattedFull}*`
-            );
+            await TelegramBot.sendMessage(store.tgToken, store.tgChatId, buildTelegramSuccessMessage(appointment, bestSlot));
           }
           return;
         } catch (shiftErr) {
@@ -575,29 +666,25 @@
   // Monitoring Scheduler & Stop Controls
   // -------------------------------------------------------------
   function scheduleNextCycle(delaySeconds) {
-    if (monitoringTimer) clearTimeout(monitoringTimer);
-    if (countdownTimer) clearInterval(countdownTimer);
+    cleanupTimers();
 
-    nextCheckTimestamp = Date.now() + delaySeconds * 1000;
+    MonitorState.nextCheckTimestamp = Date.now() + delaySeconds * 1000;
 
-    countdownTimer = setInterval(() => {
-      const remaining = Math.max(0, Math.round((nextCheckTimestamp - Date.now()) / 1000));
+    MonitorState.countdownTimer = setInterval(() => {
+      const remaining = Math.max(0, Math.round((MonitorState.nextCheckTimestamp - Date.now()) / 1000));
       updateCountdownUi(remaining);
       if (remaining <= 0) {
-        clearInterval(countdownTimer);
+        clearInterval(MonitorState.countdownTimer);
+        MonitorState.countdownTimer = null;
       }
     }, 1000);
 
-    monitoringTimer = setTimeout(runMonitoringCycle, delaySeconds * 1000);
+    MonitorState.monitoringTimer = setTimeout(runMonitoringCycle, delaySeconds * 1000);
   }
 
   async function stopMonitoring() {
-    if (monitoringTimer) clearTimeout(monitoringTimer);
-    if (countdownTimer) clearInterval(countdownTimer);
-    monitoringTimer = null;
-    countdownTimer = null;
-    isTgPollingActive = false;
-    pendingSlotToShift = null;
+    cleanupTimers();
+    MonitorState.pendingSlotToShift = null;
 
     setUnloadProtection(false);
 
@@ -931,6 +1018,7 @@
                 try {
                   await performShift(appt, targetSlot);
                   playSuccessChime();
+                  await refreshAppointmentsAfterShift();
                   await addLog(`Ручной перенос на ${targetSlot.formattedFull}`, "success");
                   alert(`✅ Запись успешно перенесена на ${targetSlot.formattedFull}!`);
                   drawer.style.display = "none";
@@ -983,11 +1071,7 @@
         const tgData = await chrome.storage.local.get(["tgToken", "tgChatId"]);
         if (tgData.tgToken && tgData.tgChatId) {
           const modeLabel = modeSelect.value === "semi" ? "📲 Полуавтомат (подтверждение кнопкой)" : "⚡ Полный автомат";
-          const startMsg = `🚀 *Мониторинг ЕМИАС запущен!*\n\n` +
-            `📋 *Запись:* ${currentAppt?.toBM ? currentAppt.toBM.name : (currentAppt?.specialityName || "Приём")}\n` +
-            `🎯 *Целевое время:* ${new Date(targetDt).toLocaleString("ru-RU")}\n` +
-            `⚙️ *Режим:* ${modeLabel}\n\n` +
-            `Вы можете остановить поиск или запросить статус кнопками ниже:`;
+          const startMsg = buildTelegramStartMessage(currentAppt, targetDt, modeLabel);
 
           const keyboard = {
             keyboard: [
@@ -1073,26 +1157,7 @@
           await addLog(`Ручной перенос на ${targetSlot.formattedFull} (${targetSlot.lpuName})`, "success");
 
           // Refresh appointments from server so popup & in-page UI immediately reflect the change
-          try {
-            const patientStore = await chrome.storage.local.get("patientContext");
-            const pCtx = patientStore.patientContext;
-            if (pCtx) {
-              const refreshed = await executeBridgeCmd("CMD_REFRESH_APPOINTMENTS", {
-                omsNumber: String(pCtx.omsNumber),
-                birthDate: String(pCtx.birthDate),
-                patientId: pCtx.patientId ? String(pCtx.patientId) : null
-              });
-              if (refreshed && refreshed.payload && refreshed.payload.appointment) {
-                await chrome.storage.local.set({
-                  appointments: refreshed.payload.appointment,
-                  lastAppointmentsSync: Date.now()
-                });
-                renderFloatingUi();
-              }
-            }
-          } catch (e) {
-            console.warn("[EMIAS] Не удалось синхронизировать записи после ручного переноса:", e);
-          }
+          await refreshAppointmentsAfterShift();
 
           sendResponse({ success: true });
         } catch (err) {
@@ -1111,47 +1176,7 @@
             return;
           }
 
-          const store = await chrome.storage.local.get(["patientContext", "eiToken", "doctorsInfoMap", "capturedRequests"]);
-          const doctorsMap = store.doctorsInfoMap || {};
-          let doctorsInfo = doctorsMap[appt.id] || doctorsMap[String(appt.id)] || doctorsMap["last"] || null;
-
-          if (!doctorsInfo || !Array.isArray(doctorsInfo) || doctorsInfo.length === 0) {
-            const allLists = Object.values(doctorsMap).filter(v => Array.isArray(v) && v.length > 0);
-            if (allLists.length > 0) doctorsInfo = allLists[allLists.length - 1];
-          }
-
-          if (!doctorsInfo || !Array.isArray(doctorsInfo) || doctorsInfo.length === 0) {
-            const reqs = store.capturedRequests || [];
-            const docReq = reqs.slice().reverse().find(r => r.url && (r.url.includes("getDoctorsInfoForLI") || r.url.includes("getDoctorsInfo")) && r.responseBody?.payload?.doctorsInfo);
-            if (docReq && Array.isArray(docReq.responseBody.payload.doctorsInfo)) {
-              doctorsInfo = docReq.responseBody.payload.doctorsInfo;
-            }
-          }
-
-          // If still empty, request directly via bridge!
-          if (!doctorsInfo || !Array.isArray(doctorsInfo) || doctorsInfo.length === 0) {
-            const pCtx = store.patientContext;
-            if (pCtx) {
-              const isBM = Boolean(appt.toBM || appt.type === "BM");
-              const res = await executeBridgeCmd("CMD_GET_DOCTORS_INFO", {
-                appointmentId: Number(appt.id),
-                lpuId: Number(appt.lpuId || 10000367),
-                isBM,
-                samplingTypeId: appt.toBM?.id || 1,
-                omsNumber: String(pCtx.omsNumber),
-                birthDate: String(pCtx.birthDate),
-                eiToken: store.eiToken || null
-              });
-              if (res && res.payload && Array.isArray(res.payload.doctorsInfo)) {
-                doctorsInfo = res.payload.doctorsInfo;
-                doctorsMap[appt.id] = doctorsInfo;
-                doctorsMap[String(appt.id)] = doctorsInfo;
-                doctorsMap["last"] = doctorsInfo;
-                await chrome.storage.local.set({ doctorsInfoMap: doctorsMap });
-              }
-            }
-          }
-
+          const doctorsInfo = await getResilientDoctorsList(appt, true);
           sendResponse({ success: true, doctorsInfo: doctorsInfo || [] });
         } catch (err) {
           sendResponse({ success: false, error: err.message });
@@ -1174,11 +1199,7 @@
         if (tgData.tgToken && tgData.tgChatId) {
           const appt = tgData.appointments?.find(a => String(a.id) === String(message.payload.appointmentId)) || tgData.appointments?.[0];
           const modeLabel = message.payload.transferMode === "semi" ? "📲 Полуавтомат (подтверждение кнопкой)" : "⚡ Полный автомат";
-          const startMsg = `🚀 *Мониторинг ЕМИАС запущен!*\n\n` +
-            `📋 *Запись:* ${appt?.toBM ? appt.toBM.name : (appt?.specialityName || "Приём")}\n` +
-            `🎯 *Целевое время:* ${new Date(message.payload.targetDatetime).toLocaleString("ru-RU")}\n` +
-            `⚙️ *Режим:* ${modeLabel}\n\n` +
-            `Вы можете остановить поиск или запросить статус кнопками ниже:`;
+          const startMsg = buildTelegramStartMessage(appt, message.payload.targetDatetime, modeLabel);
 
           const keyboard = {
             keyboard: [

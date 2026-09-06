@@ -1,38 +1,56 @@
 // Background Service Worker (Manifest V3)
+importScripts("utils/telegram.js");
 
+function updateBadge(active) {
+  const text = active ? "ON" : "";
+  chrome.action.setBadgeText({ text });
+  chrome.action.setBadgeBackgroundColor({ color: active ? "#16a34a" : "#64748b" });
+}
+
+// Initialize on extension install or update
 chrome.runtime.onInstalled.addListener(async () => {
-  console.log("[EMIAS Assistant] Расширение успешно установлено.");
-  await chrome.action.setBadgeText({ text: "" });
+  console.log("[EMIAS Assistant] Расширение успешно установлено/обновлено.");
+  const store = await chrome.storage.local.get("monitoringActive");
+  updateBadge(Boolean(store.monitoringActive));
 });
 
-// Update badge or send notifications
+// Reactively keep badge in sync with monitoringActive in storage
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.monitoringActive) {
+    updateBadge(Boolean(changes.monitoringActive.newValue));
+  }
+});
+
+// Sync badge on service worker wake-up
+chrome.storage.local.get("monitoringActive").then(store => {
+  updateBadge(Boolean(store.monitoringActive));
+});
+
+// Message listener for popup & content requests
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // 1. Send test message to Telegram
   if (message.type === "SEND_TELEGRAM_TEST") {
     (async () => {
       try {
-        const { botToken, chatId } = message.payload;
+        const { botToken, chatId } = message.payload || {};
         if (!botToken || !chatId) {
           sendResponse({ success: false, error: "Укажите Bot Token и Chat ID" });
           return;
         }
 
-        const text = encodeURIComponent("🔔 *ЕМИАС Автоперенос*\nТестовое уведомление успешно доставлено!");
-        const url = `https://api.telegram.org/bot${botToken}/sendMessage?chat_id=${chatId}&text=${text}&parse_mode=Markdown`;
+        const text = "🔔 *ЕМИАС Автоперенос*\nТестовое уведомление успешно доставлено!";
+        const res = await TelegramBot.sendMessage(botToken, chatId, text);
 
-        const res = await fetch(url);
-        const data = await res.json();
-
-        if (data.ok) {
+        if (res && res.ok) {
           sendResponse({ success: true });
         } else {
-          sendResponse({ success: false, error: data.description || "Ошибка Telegram API" });
+          sendResponse({ success: false, error: res?.description || res?.error || "Ошибка Telegram API" });
         }
       } catch (err) {
         sendResponse({ success: false, error: err.message });
       }
     })();
-    return true; // Keep channel open
+    return true; // Keep message channel open for async response
   }
 
   // 2. Send actual success notification to Telegram
@@ -47,12 +65,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return;
         }
 
-        const text = encodeURIComponent(message.payload.text || "🎉 Запись в ЕМИАС успешно перенесена!");
-        const url = `https://api.telegram.org/bot${tgToken}/sendMessage?chat_id=${tgChatId}&text=${text}&parse_mode=Markdown`;
-
-        const res = await fetch(url);
-        const data = await res.json();
-        sendResponse({ success: Boolean(data.ok) });
+        const text = message.payload?.text || "🎉 Запись в ЕМИАС успешно перенесена!";
+        const res = await TelegramBot.sendMessage(tgToken, tgChatId, text);
+        sendResponse({ success: Boolean(res && res.ok) });
       } catch (err) {
         console.error("[EMIAS Assistant] Telegram send error:", err);
         sendResponse({ success: false, error: err.message });
@@ -61,11 +76,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // 3. Update extension icon badge
+  // 3. Explicit badge update command fallback
   if (message.type === "UPDATE_MONITOR_BADGE") {
-    const text = message.active ? "ON" : "";
-    chrome.action.setBadgeText({ text });
-    chrome.action.setBadgeBackgroundColor({ color: message.active ? "#16a34a" : "#64748b" });
+    updateBadge(Boolean(message.active));
     sendResponse({ status: "ok" });
     return false;
   }

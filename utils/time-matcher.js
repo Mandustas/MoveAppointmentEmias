@@ -27,6 +27,78 @@ function formatDateTimeNice(dt) {
 }
 
 /**
+ * Format Date to YYYY-MM-DD in local time
+ * @param {Date} [d] Optional Date instance (defaults to now)
+ * @returns {string} Date formatted as YYYY-MM-DD
+ */
+function formatIsoDate(d = new Date()) {
+  const dateObj = d instanceof Date ? d : new Date(d);
+  const year = dateObj.getFullYear();
+  const month = String(dateObj.getMonth() + 1).padStart(2, "0");
+  const day = String(dateObj.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Get today's date formatted as YYYY-MM-DD
+ * @returns {string}
+ */
+function getTodayDateStr() {
+  return formatIsoDate(new Date());
+}
+
+/**
+ * Get date string offset by specified number of days from today
+ * @param {number} offsetDays Positive or negative day offset
+ * @returns {string} YYYY-MM-DD
+ */
+function getDateOffsetStr(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return formatIsoDate(d);
+}
+
+/**
+ * Extract and normalize clinic branches from an appointment and its doctorsInfo list
+ * @param {Object} [appointment] Active appointment object
+ * @param {Array} [doctorsInfoList] Discovered doctorsInfo array
+ * @returns {Array<{ lpuId: string, name: string, address: string, isCurrent: boolean }>}
+ */
+function extractBranches(appointment, doctorsInfoList) {
+  const branchesMap = new Map();
+
+  // 1. Current appointment branch
+  if (appointment && appointment.lpuId) {
+    const curLpuId = String(appointment.lpuId);
+    branchesMap.set(curLpuId, {
+      lpuId: curLpuId,
+      name: appointment.nameLpu || `Филиал #${curLpuId}`,
+      address: appointment.lpuAddress || appointment.address || "",
+      isCurrent: true
+    });
+  }
+
+  // 2. Discovered branches from doctorsInfoList
+  if (Array.isArray(doctorsInfoList)) {
+    for (const doc of doctorsInfoList) {
+      if (!doc) continue;
+      const lpuId = String(doc.lpuId || (doc.availableResources && doc.availableResources[0] && doc.availableResources[0].lpuId) || "");
+      if (!lpuId) continue;
+      const existing = branchesMap.get(lpuId) || {};
+      const isCur = existing.isCurrent || Boolean(appointment && String(appointment.lpuId) === lpuId);
+      branchesMap.set(lpuId, {
+        lpuId,
+        name: doc.lpuShortName || existing.name || `Филиал #${lpuId}`,
+        address: doc.defaultAddress || existing.address || "",
+        isCurrent: isCur
+      });
+    }
+  }
+
+  return Array.from(branchesMap.values());
+}
+
+/**
  * Extract flat list of slots from EMIAS scheduleOfDay response
  * @param {Array} scheduleOfDay
  * @param {Object} resourceInfo
@@ -141,5 +213,16 @@ function findBestSlots(slots, targetDateTime, options = {}) {
 
 // Export for extension modules
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseDateTime, formatTime, formatDate, formatDateTimeNice, extractSlotsFromSchedule, findBestSlots };
+  module.exports = {
+    parseDateTime,
+    formatTime,
+    formatDate,
+    formatDateTimeNice,
+    formatIsoDate,
+    getTodayDateStr,
+    getDateOffsetStr,
+    extractBranches,
+    extractSlotsFromSchedule,
+    findBestSlots
+  };
 }
