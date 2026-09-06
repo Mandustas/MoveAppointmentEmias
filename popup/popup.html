@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ЕМИАС Автоперенос</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo-area">
+        <span class="logo-icon">🩺</span>
+        <div>
+          <h1 class="title">ЕМИАС Автоперенос</h1>
+          <span class="version">v1.1.0 (Авто-снайпер)</span>
+        </div>
+      </div>
+      <div id="connection-status" class="status-pill status-checking">
+        <span class="dot"></span>
+        <span class="status-text">Проверка...</span>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="tab-control">⚡ Перенос</button>
+      <button class="tab-btn" data-tab="tab-telegram">📱 Telegram</button>
+      <button class="tab-btn" data-tab="tab-sniffer">🔍 Сниффер API</button>
+    </nav>
+
+    <!-- Tab 1: Control & Reschedule -->
+    <section id="tab-control" class="tab-content active">
+      <!-- Status Card -->
+      <div id="monitor-status-card" class="monitor-card inactive">
+        <div class="monitor-header">
+          <span id="monitor-badge" class="badge">⚪ Мониторинг выключен</span>
+          <span id="monitor-counter" class="subtext"></span>
+        </div>
+        <div id="monitor-detail" class="monitor-detail">
+          Выберите параметры и запустите поиск или проверьте слоты прямо сейчас.
+        </div>
+      </div>
+
+      <!-- Form -->
+      <div class="form-group">
+        <label class="form-label">Запись для переноса:</label>
+        <select id="appointment-select" class="form-select">
+          <option value="">Загрузка записей из ЕМИАС...</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Желаемое целевое время:</label>
+        <input type="datetime-local" id="target-datetime" class="form-input">
+        <span class="form-hint">Система ищет слоты с минимальным отклонением от этой даты и времени</span>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group" style="flex: 1;">
+          <label class="form-label">Допустимое окно:</label>
+          <select id="time-window" class="form-select">
+            <option value="15">± 15 минут</option>
+            <option value="30">± 30 минут</option>
+            <option value="60" selected>± 1 час</option>
+            <option value="120">± 2 часа</option>
+            <option value="any">Весь день</option>
+          </select>
+        </div>
+
+        <div class="form-group checkbox-cell">
+          <label class="checkbox-label">
+            <input type="checkbox" id="any-doctor" checked>
+            <span>Любой врач/филиал</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="button-row">
+        <button id="find-now-btn" class="btn btn-secondary">
+          🔍 Найти слоты сейчас
+        </button>
+        <button id="toggle-monitor-btn" class="btn btn-primary">
+          🚀 Запустить автоперенос
+        </button>
+      </div>
+
+      <!-- Search results preview -->
+      <div id="quick-slots-container" class="slots-box hidden">
+        <div class="slots-title">Доступные слоты:</div>
+        <div id="slots-list" class="slots-list"></div>
+      </div>
+    </section>
+
+    <!-- Tab 2: Telegram Settings -->
+    <section id="tab-telegram" class="tab-content">
+      <div class="info-card">
+        <div class="info-icon">📲</div>
+        <div class="info-text">
+          Бот пришлет мгновенное уведомление на ваш телефон, как только перенос записи будет успешно завершен.
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Telegram Bot Token:</label>
+        <input type="password" id="tg-token" class="form-input" placeholder="123456789:ABCdefGHIjklMNOpqr...">
+        <span class="form-hint">Токен из диалога с ботом @BotFather</span>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Telegram Chat ID:</label>
+        <input type="text" id="tg-chat-id" class="form-input" placeholder="например, 123456789">
+        <span class="form-hint">Ваш ID (можно узнать у бота @userinfobot)</span>
+      </div>
+
+      <div class="button-row">
+        <button id="save-tg-btn" class="btn btn-primary">Сохранить</button>
+        <button id="test-tg-btn" class="btn btn-secondary">Отправить тест</button>
+      </div>
+      <div id="tg-test-status" class="status-msg"></div>
+    </section>
+
+    <!-- Tab 3: Sniffer API Logs -->
+    <section id="tab-sniffer" class="tab-content">
+      <div class="stats-row">
+        <div class="stat-box">
+          <span class="stat-label">Перехвачено запросов</span>
+          <span id="requests-count" class="stat-value">0</span>
+        </div>
+        <div class="stat-actions">
+          <button id="copy-summary-btn" class="btn btn-primary">
+            📋 Скопировать
+          </button>
+          <button id="clear-requests-btn" class="btn btn-secondary">
+            Очистить
+          </button>
+        </div>
+      </div>
+
+      <div class="section-title">Журнал запросов:</div>
+      <div id="requests-container" class="requests-list">
+        <div class="empty-state">
+          <span>Ожидание сетевой активности на emias.info...</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Footer Toast -->
+    <footer class="footer">
+      <div id="toast" class="toast hidden"></div>
+    </footer>
+  </div>
+
+  <script src="../utils/time-matcher.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
