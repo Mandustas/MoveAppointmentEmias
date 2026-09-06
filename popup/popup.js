@@ -1,4 +1,4 @@
-// Popup script for EMIAS Reschedule Assistant
+// Popup script for EMIAS Reschedule Assistant v1.2.0
 document.addEventListener("DOMContentLoaded", async () => {
   // Tabs
   const tabButtons = document.querySelectorAll(".tab-btn");
@@ -17,9 +17,26 @@ document.addEventListener("DOMContentLoaded", async () => {
   const monitorBadge = document.getElementById("monitor-badge");
   const monitorCounter = document.getElementById("monitor-counter");
   const monitorDetail = document.getElementById("monitor-detail");
+  const monitorPulseDot = document.getElementById("monitor-pulse-dot");
 
+  // Rich card elements
+  const cardApptNum = document.getElementById("card-appt-num");
+  const cardApptBranchShort = document.getElementById("card-appt-branch-short");
+  const cardApptTitle = document.getElementById("card-appt-title");
+  const cardApptTime = document.getElementById("card-appt-time");
+  const cardApptLpu = document.getElementById("card-appt-lpu");
+
+  // Mode elements
+  const modePills = document.querySelectorAll(".mode-pill");
+  const modeInputs = document.querySelectorAll("input[name='transfer-mode']");
+
+  // Slots preview
   const quickSlotsContainer = document.getElementById("quick-slots-container");
   const slotsList = document.getElementById("slots-list");
+
+  // Log Tab elements
+  const popupLogList = document.getElementById("popup-log-list");
+  const popupClearLogBtn = document.getElementById("popup-clear-log-btn");
 
   // Telegram Elements
   const tgTokenInput = document.getElementById("tg-token");
@@ -35,6 +52,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   const clearRequestsBtn = document.getElementById("clear-requests-btn");
   const toast = document.getElementById("toast");
 
+  let cachedAppointments = [];
+
   function showToast(text, duration = 2200) {
     toast.textContent = text;
     toast.classList.remove("hidden");
@@ -49,18 +68,42 @@ document.addEventListener("DOMContentLoaded", async () => {
       btn.classList.add("active");
       const targetId = btn.getAttribute("data-tab");
       document.getElementById(targetId).classList.add("active");
+      if (targetId === "tab-log") loadLogs();
     });
   });
+
+  // Mode Selection pills
+  modeInputs.forEach(input => {
+    input.addEventListener("change", async () => {
+      modePills.forEach(p => p.classList.remove("selected"));
+      input.closest(".mode-pill").classList.add("selected");
+      await chrome.storage.local.set({ transferMode: input.value });
+    });
+  });
+
+  function getSelectedMode() {
+    const checked = document.querySelector("input[name='transfer-mode']:checked");
+    return checked ? checked.value : "semi";
+  }
+
+  async function initMode() {
+    const store = await chrome.storage.local.get("transferMode");
+    const mode = store.transferMode || "semi";
+    modeInputs.forEach(input => {
+      if (input.value === mode) {
+        input.checked = true;
+        modePills.forEach(p => p.classList.remove("selected"));
+        input.closest(".mode-pill").classList.add("selected");
+      }
+    });
+  }
 
   // Get active EMIAS tab
   async function getActiveEmiaTab() {
     try {
       const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
       const tab = tabs[0];
-      if (tab && tab.url && tab.url.includes("emias.info")) {
-        return tab;
-      }
-      // Fallback: look for any emias tab in window
+      if (tab && tab.url && tab.url.includes("emias.info")) return tab;
       const allTabs = await chrome.tabs.query({ currentWindow: true });
       return allTabs.find(t => t.url && t.url.includes("emias.info")) || null;
     } catch (e) {
@@ -81,29 +124,60 @@ document.addEventListener("DOMContentLoaded", async () => {
     return tab;
   }
 
-  // Load active appointments into select
-  async function loadAppointments() {
-    const store = await chrome.storage.local.get("appointments");
-    const list = store.appointments || [];
-
-    apptSelect.innerHTML = "";
-
-    if (list.length === 0) {
-      apptSelect.innerHTML = '<option value="">Нет сохраненных записей. Откройте ЕМИАС</option>';
+  // Render Rich Appointment Card
+  function updateRichCard(appt) {
+    if (!appt) {
+      cardApptNum.textContent = "НЕТ ЗАПИСЕЙ";
+      cardApptBranchShort.textContent = "";
+      cardApptTitle.textContent = "🩺 Откройте emias.info для загрузки записей";
+      cardApptTime.textContent = "";
+      cardApptLpu.textContent = "";
       return;
     }
 
-    list.forEach(a => {
+    cardApptNum.textContent = appt.number || "АКТИВНАЯ ЗАПИСЬ";
+    cardApptBranchShort.textContent = appt.nameLpu ? (appt.nameLpu.split(" ").slice(-2).join(" ")) : "";
+    cardApptTitle.textContent = `🩺 ${appt.toBM ? appt.toBM.name : (appt.specialityName || "Приём врача")}`;
+
+    const start = new Date(appt.startTime);
+    cardApptTime.textContent = `📅 ${start.toLocaleDateString("ru-RU", { day: "2-digit", month: "long", year: "numeric" })} в ${start.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
+    cardApptLpu.textContent = `📍 ${appt.nameLpu || "Поликлиника"} (${appt.roomNumber || ""})`;
+  }
+
+  // Load appointments
+  async function loadAppointments() {
+    const store = await chrome.storage.local.get(["appointments", "monitoringConfig"]);
+    cachedAppointments = store.appointments || [];
+
+    apptSelect.innerHTML = "";
+
+    if (cachedAppointments.length === 0) {
+      apptSelect.innerHTML = '<option value="">Нет сохраненных записей</option>';
+      updateRichCard(null);
+      return;
+    }
+
+    cachedAppointments.forEach((a, idx) => {
       const opt = document.createElement("option");
       opt.value = a.id;
       const start = new Date(a.startTime);
       const dateStr = start.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" });
       const timeStr = start.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
-      const title = a.toBM ? a.toBM.name : (a.specialityName || "Приём врача");
-      opt.textContent = `[${a.number || "Запись"}] ${title} — ${dateStr} в ${timeStr}`;
+      const title = a.toBM ? a.toBM.name : (a.specialityName || "Приём");
+      opt.textContent = `Запись #${idx + 1} (${title} · ${dateStr} ${timeStr})`;
       apptSelect.appendChild(opt);
     });
+
+    const targetId = store.monitoringConfig?.appointmentId || cachedAppointments[0].id;
+    apptSelect.value = targetId;
+    const selected = cachedAppointments.find(a => String(a.id) === String(apptSelect.value)) || cachedAppointments[0];
+    updateRichCard(selected);
   }
+
+  apptSelect.addEventListener("change", () => {
+    const selected = cachedAppointments.find(a => String(a.id) === String(apptSelect.value));
+    updateRichCard(selected);
+  });
 
   // Populate default target datetime
   async function initTargetDateTime() {
@@ -114,7 +188,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (store.monitoringConfig.anyDoctor !== undefined) anyDoctorCb.checked = store.monitoringConfig.anyDoctor;
       if (store.monitoringConfig.appointmentId) apptSelect.value = store.monitoringConfig.appointmentId;
     } else {
-      // Default: tomorrow at 10:00
       const d = new Date();
       d.setDate(d.getDate() + 1);
       d.setHours(10, 0, 0, 0);
@@ -125,28 +198,59 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Render Monitor Card
   async function updateMonitorCard() {
-    const store = await chrome.storage.local.get(["monitoringActive", "monitoringConfig"]);
+    const store = await chrome.storage.local.get(["monitoringActive", "monitoringConfig", "transferMode"]);
     const isActive = Boolean(store.monitoringActive);
     const config = store.monitoringConfig || {};
+    const mode = store.transferMode || "semi";
 
     if (isActive) {
       monitorCard.className = "monitor-card active";
-      monitorBadge.innerHTML = "🟢 Автопоиск запущен";
+      monitorPulseDot.classList.remove("hidden");
+      monitorBadge.innerHTML = "Автопоиск запущен";
       monitorBadge.style.color = "#15803d";
       monitorCounter.textContent = `Проверок: ${config.checkCount || 0}`;
-      monitorDetail.textContent = `Отслеживание слотов для выбранной записи с интервалом 20-30с. При появлении слота будет выполнен мгновенный перенос.`;
+
+      const modeStr = mode === "semi" ? "Полуавтомат (кнопка в TG)" : "Полный автомат";
+      monitorDetail.innerHTML = `Режим: <b>${modeStr}</b>. Опрос каждые 20-30с со случайным разбросом. При появлении слота придет запрос в Telegram.`;
       toggleMonitorBtn.textContent = "⏹️ Остановить поиск";
       toggleMonitorBtn.className = "btn btn-danger";
     } else {
       monitorCard.className = "monitor-card inactive";
+      monitorPulseDot.classList.add("hidden");
       monitorBadge.innerHTML = "⚪ Мониторинг выключен";
       monitorBadge.style.color = "#475569";
       monitorCounter.textContent = "";
-      monitorDetail.textContent = "Выберите запись, желаемое время и нажмите кнопку автопереноса.";
+      monitorDetail.textContent = "Выберите запись, желаемое время и запустите поиск слотов.";
       toggleMonitorBtn.textContent = "🚀 Запустить автоперенос";
       toggleMonitorBtn.className = "btn btn-primary";
     }
   }
+
+  // Mini Logs
+  async function loadLogs() {
+    const store = await chrome.storage.local.get("monitoringLogs");
+    const logs = store.monitoringLogs || [];
+
+    if (logs.length === 0) {
+      popupLogList.innerHTML = '<div class="empty-state">История проверок пока пуста</div>';
+      return;
+    }
+
+    popupLogList.innerHTML = logs.slice().reverse().map(l => {
+      const cls = l.type === "success" ? "log-success" : (l.type === "match" ? "log-match" : (l.type === "error" ? "log-error" : (l.type === "stop" ? "log-stop" : "log-info")));
+      return `
+        <div class="log-item ${cls}">
+          <span class="log-time">${l.time}</span> ${l.text}
+        </div>
+      `;
+    }).join("");
+  }
+
+  popupClearLogBtn.addEventListener("click", async () => {
+    await chrome.storage.local.set({ monitoringLogs: [] });
+    await loadLogs();
+    showToast("Журнал очищен");
+  });
 
   // Find Now
   findNowBtn.addEventListener("click", async () => {
@@ -180,13 +284,13 @@ document.addEventListener("DOMContentLoaded", async () => {
       });
 
       if (!response || !response.success) {
-        slotsList.innerHTML = `<div style="color:#dc2626;padding:8px;">${response ? response.error : "Нет ответа от страницы ЕМИАС. Обновите вкладку ЕМИАС."}</div>`;
+        slotsList.innerHTML = `<div style="color:#dc2626;padding:8px;">${response ? response.error : "Обновите вкладку ЕМИАС."}</div>`;
         return;
       }
 
       const matched = response.matchedSlots || [];
       if (matched.length === 0) {
-        slotsList.innerHTML = `<div style="color:#64748b;text-align:center;padding:10px;">На эту дату подходящих слотов не найдено (всего проверено: ${response.totalSlots}). Запустите автоперенос для ожидания отмен.</div>`;
+        slotsList.innerHTML = `<div style="color:#64748b;text-align:center;padding:10px;">На эту дату подходящих слотов не найдено (проверено: ${response.totalSlots}). Запустите автоперенос для ожидания отмен.</div>`;
       } else {
         slotsList.innerHTML = "";
         matched.slice(0, 6).forEach(slot => {
@@ -264,6 +368,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         targetDatetime: targetDtInput.value,
         timeWindow: timeWindowSelect.value,
         anyDoctor: anyDoctorCb.checked,
+        transferMode: getSelectedMode(),
         checkCount: 0
       };
 
@@ -326,11 +431,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     requestsCount.textContent = list.length;
 
     if (list.length === 0) {
-      requestsContainer.innerHTML = `
-        <div class="empty-state">
-          <span>Ожидание сетевой активности на emias.info...</span>
-        </div>
-      `;
+      requestsContainer.innerHTML = '<div class="empty-state">Ожидание сетевой активности на emias.info...</div>';
       return;
     }
 
@@ -375,13 +476,15 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Init
   await updateConnection();
   await loadAppointments();
+  await initMode();
   await initTargetDateTime();
   await updateMonitorCard();
   await loadTgSettings();
+  await loadLogs();
   await loadRequests();
 
-  // Polling update for popup UI
   setInterval(async () => {
     await updateMonitorCard();
+    await loadLogs();
   }, 1500);
 });

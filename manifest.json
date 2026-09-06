@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ЕМИАС Автоперенос записи",
-  "version": "1.1.0",
-  "description": "Поиск слотов и автоматический перенос записи к врачу на emias.info на ближайшее к желаемому время",
+  "version": "1.2.0",
+  "description": "Умный поиск слотов и полуавтоматический перенос записи к врачу на emias.info с подтверждением в Telegram",
   "permissions": [
     "storage",
     "alarms",
@@ -40,7 +40,7 @@
     },
     {
       "matches": ["https://emias.info/*", "https://*.emias.info/*"],
-      "js": ["utils/time-matcher.js", "content.js"],
+      "js": ["utils/time-matcher.js", "utils/telegram.js", "content.js"],
       "run_at": "document_start"
     }
   ]
