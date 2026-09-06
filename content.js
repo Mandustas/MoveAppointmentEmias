@@ -154,17 +154,26 @@
     const doctorsMap = store.doctorsInfoMap || {};
     const doctorsInfoList = doctorsMap[appointment.id] || [];
 
-    // Calculate dates safely
+    // Calculate dates: EMIAS mandates that dateFrom MUST ALWAYS BE today!
+    // Querying with dateFrom in the future causes SA_REFERRAL_FOR_FUTURE (HTTP 400).
     const now = new Date();
     const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const dateFrom = todayStr;
 
-    const cleanTargetDate = targetDateStr ? targetDateStr.split("T")[0] : todayStr;
-    const dateFrom = cleanTargetDate < todayStr ? todayStr : cleanTargetDate;
-
-    // Period: 7 days window starting from dateFrom
-    const fromObj = new Date(dateFrom + "T00:00:00");
+    // Period: 7 days window starting from today (matches official EMIAS web portal)
+    const fromObj = new Date(todayStr + "T00:00:00");
     const toObj = new Date(fromObj);
     toObj.setDate(toObj.getDate() + 7);
+
+    // If target date is further than 7 days, extend dateTo (up to 14 days max)
+    const cleanTargetDate = targetDateStr ? targetDateStr.split("T")[0] : todayStr;
+    if (cleanTargetDate > todayStr) {
+      const targetObj = new Date(cleanTargetDate + "T00:00:00");
+      const diffDays = Math.ceil((targetObj - fromObj) / (1000 * 60 * 60 * 24));
+      if (diffDays > 7) {
+        toObj.setTime(fromObj.getTime() + Math.min(diffDays + 2, 14) * 86400000);
+      }
+    }
     const dateTo = `${toObj.getFullYear()}-${String(toObj.getMonth() + 1).padStart(2, '0')}-${String(toObj.getDate()).padStart(2, '0')}`;
 
     const resourcesToQuery = [];

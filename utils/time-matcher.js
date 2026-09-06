@@ -93,7 +93,7 @@ function findBestSlots(slots, targetDateTime, options = {}) {
   const onlyTargetDate = options.onlyTargetDate !== undefined ? options.onlyTargetDate : true;
   const isAnyTime = options.windowMinutes === "any" || windowMinutes === null;
 
-  const targetDateStr = target.toISOString().split("T")[0];
+  const targetDateStr = `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, '0')}-${String(target.getDate()).padStart(2, '0')}`;
 
   const matched = [];
 
@@ -105,7 +105,7 @@ function findBestSlots(slots, targetDateTime, options = {}) {
 
     // Filter by target date if required
     if (onlyTargetDate) {
-      const slotDateStr = slot.startDate.toISOString().split("T")[0];
+      const slotDateStr = slot.dateStr || `${slot.startDate.getFullYear()}-${String(slot.startDate.getMonth() + 1).padStart(2, '0')}-${String(slot.startDate.getDate()).padStart(2, '0')}`;
       if (slotDateStr !== targetDateStr) {
         continue;
       }
