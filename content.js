@@ -149,14 +149,31 @@
   // Schedule & Shift API
   // -------------------------------------------------------------
   async function fetchAvailableSchedule(appointment, targetDateStr, configOverride = null) {
-    const store = await chrome.storage.local.get(["patientContext", "doctorsInfoMap", "monitoringConfig", "eiToken"]);
+    const store = await chrome.storage.local.get(["patientContext", "doctorsInfoMap", "monitoringConfig", "eiToken", "capturedRequests"]);
     const patientContext = store.patientContext;
     if (!patientContext || !patientContext.omsNumber || !patientContext.birthDate) {
       throw new Error("Сессия не синхронизирована. Обновите страницу ЕМИАС (F5)");
     }
 
     const doctorsMap = store.doctorsInfoMap || {};
-    const doctorsInfoList = doctorsMap[appointment.id] || doctorsMap[String(appointment.id)] || doctorsMap["last"] || [];
+    let doctorsInfoList = doctorsMap[appointment.id] || doctorsMap[String(appointment.id)] || doctorsMap["last"] || null;
+
+    if (!doctorsInfoList || !Array.isArray(doctorsInfoList) || doctorsInfoList.length === 0) {
+      const allLists = Object.values(doctorsMap).filter(v => Array.isArray(v) && v.length > 0);
+      if (allLists.length > 0) {
+        doctorsInfoList = allLists[allLists.length - 1];
+      }
+    }
+
+    if (!doctorsInfoList || !Array.isArray(doctorsInfoList) || doctorsInfoList.length === 0) {
+      const reqs = store.capturedRequests || [];
+      const docReq = reqs.slice().reverse().find(r => r.url && (r.url.includes("getDoctorsInfoForLI") || r.url.includes("getDoctorsInfo")) && r.responseBody?.payload?.doctorsInfo);
+      if (docReq && Array.isArray(docReq.responseBody.payload.doctorsInfo)) {
+        doctorsInfoList = docReq.responseBody.payload.doctorsInfo;
+      }
+    }
+
+    if (!Array.isArray(doctorsInfoList)) doctorsInfoList = [];
 
     // Calculate dates: EMIAS mandates that dateFrom MUST ALWAYS BE today!
     // Querying with dateFrom in the future causes SA_REFERRAL_FOR_FUTURE (HTTP 400).
@@ -1078,6 +1095,64 @@
           }
 
           sendResponse({ success: true });
+        } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
+    if (message.type === "POPUP_FETCH_BRANCHES") {
+      (async () => {
+        try {
+          const appt = message.payload?.appointment;
+          if (!appt) {
+            sendResponse({ success: false, error: "Нет данных записи" });
+            return;
+          }
+
+          const store = await chrome.storage.local.get(["patientContext", "eiToken", "doctorsInfoMap", "capturedRequests"]);
+          const doctorsMap = store.doctorsInfoMap || {};
+          let doctorsInfo = doctorsMap[appt.id] || doctorsMap[String(appt.id)] || doctorsMap["last"] || null;
+
+          if (!doctorsInfo || !Array.isArray(doctorsInfo) || doctorsInfo.length === 0) {
+            const allLists = Object.values(doctorsMap).filter(v => Array.isArray(v) && v.length > 0);
+            if (allLists.length > 0) doctorsInfo = allLists[allLists.length - 1];
+          }
+
+          if (!doctorsInfo || !Array.isArray(doctorsInfo) || doctorsInfo.length === 0) {
+            const reqs = store.capturedRequests || [];
+            const docReq = reqs.slice().reverse().find(r => r.url && (r.url.includes("getDoctorsInfoForLI") || r.url.includes("getDoctorsInfo")) && r.responseBody?.payload?.doctorsInfo);
+            if (docReq && Array.isArray(docReq.responseBody.payload.doctorsInfo)) {
+              doctorsInfo = docReq.responseBody.payload.doctorsInfo;
+            }
+          }
+
+          // If still empty, request directly via bridge!
+          if (!doctorsInfo || !Array.isArray(doctorsInfo) || doctorsInfo.length === 0) {
+            const pCtx = store.patientContext;
+            if (pCtx) {
+              const isBM = Boolean(appt.toBM || appt.type === "BM");
+              const res = await executeBridgeCmd("CMD_GET_DOCTORS_INFO", {
+                appointmentId: Number(appt.id),
+                lpuId: Number(appt.lpuId || 10000367),
+                isBM,
+                samplingTypeId: appt.toBM?.id || 1,
+                omsNumber: String(pCtx.omsNumber),
+                birthDate: String(pCtx.birthDate),
+                eiToken: store.eiToken || null
+              });
+              if (res && res.payload && Array.isArray(res.payload.doctorsInfo)) {
+                doctorsInfo = res.payload.doctorsInfo;
+                doctorsMap[appt.id] = doctorsInfo;
+                doctorsMap[String(appt.id)] = doctorsInfo;
+                doctorsMap["last"] = doctorsInfo;
+                await chrome.storage.local.set({ doctorsInfoMap: doctorsMap });
+              }
+            }
+          }
+
+          sendResponse({ success: true, doctorsInfo: doctorsInfo || [] });
         } catch (err) {
           sendResponse({ success: false, error: err.message });
         }

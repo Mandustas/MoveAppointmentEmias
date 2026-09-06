@@ -581,6 +581,70 @@
           status: res.status,
           data
         }, "*");
+      } else if (action === "CMD_GET_DOCTORS_INFO") {
+        if (!window.__EMIAS_PATIENT__) {
+          scanStorageForPatient();
+        }
+        if (payload.eiToken && !window.__EMIAS_EI_TOKEN__) {
+          window.__EMIAS_EI_TOKEN__ = payload.eiToken;
+        }
+        if ((!payload.birthDate || payload.birthDate === "undefined" || payload.birthDate.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
+          payload.birthDate = window.__EMIAS_PATIENT__.birthDate;
+        }
+        if ((!payload.omsNumber || payload.omsNumber === "undefined" || payload.omsNumber.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
+          payload.omsNumber = window.__EMIAS_PATIENT__.omsNumber;
+        }
+
+        const now = new Date();
+        const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+        const nextWeek = new Date(now.getTime() + 7 * 86400000);
+        const nextWeekStr = `${nextWeek.getFullYear()}-${String(nextWeek.getMonth() + 1).padStart(2, '0')}-${String(nextWeek.getDate()).padStart(2, '0')}`;
+
+        const isBM = payload.isBM !== false;
+        const endpoint = isBM
+          ? "/api-eip/v4/saOrchestrator/getDoctorsInfoForLI"
+          : "/api-eip/v4/saOrchestrator/getDoctorsInfo";
+
+        const requestPayload = isBM ? {
+          appointmentId: Number(payload.appointmentId),
+          assignment: {
+            moId: Number(payload.lpuId || 10000367),
+            period: {
+              dateFrom: payload.dateFrom || todayStr,
+              dateTo: payload.dateTo || nextWeekStr
+            },
+            samplingTypeId: Number(payload.samplingTypeId || 1)
+          },
+          birthDate: payload.birthDate,
+          omsNumber: payload.omsNumber
+        } : {
+          appointmentId: Number(payload.appointmentId),
+          birthDate: payload.birthDate,
+          omsNumber: payload.omsNumber
+        };
+
+        const reqHeaders = buildRequestHeaders();
+        const res = await originalFetch(endpoint, {
+          method: "POST",
+          credentials: "include",
+          headers: reqHeaders,
+          body: JSON.stringify(requestPayload)
+        });
+        const data = await res.json();
+        if (data && data.payload && data.payload.doctorsInfo) {
+          window.postMessage({
+            source: "EMIAS_INTERCEPTOR",
+            type: "DOCTORS_INFO_SYNC",
+            payload: { appointmentId: payload.appointmentId, doctorsInfo: data.payload.doctorsInfo }
+          }, "*");
+        }
+        window.postMessage({
+          source: "EMIAS_INTERCEPTOR",
+          action: "RES_GET_DOCTORS_INFO",
+          reqId,
+          status: res.status,
+          data
+        }, "*");
       }
     } catch (err) {
       console.error("[EMIAS Interceptor Bridge Error]", err);

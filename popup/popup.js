@@ -194,9 +194,48 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
-    const store = await chrome.storage.local.get(["doctorsInfoMap", "monitoringConfig"]);
+    const store = await chrome.storage.local.get(["doctorsInfoMap", "monitoringConfig", "capturedRequests"]);
     const doctorsMap = store.doctorsInfoMap || {};
-    const doctorsList = doctorsMap[selectedAppt.id] || doctorsMap[String(selectedAppt.id)] || doctorsMap["last"] || [];
+    let doctorsList = doctorsMap[selectedAppt.id] || doctorsMap[String(selectedAppt.id)] || doctorsMap["last"] || null;
+
+    // Fallback 1: Any existing entry in doctorsInfoMap
+    if (!doctorsList || !Array.isArray(doctorsList) || doctorsList.length === 0) {
+      const allLists = Object.values(doctorsMap).filter(v => Array.isArray(v) && v.length > 0);
+      if (allLists.length > 0) {
+        doctorsList = allLists[allLists.length - 1];
+      }
+    }
+
+    // Fallback 2: Check capturedRequests sniffer history
+    if (!doctorsList || !Array.isArray(doctorsList) || doctorsList.length === 0) {
+      const reqs = store.capturedRequests || [];
+      const docReq = reqs.slice().reverse().find(r => r.url && (r.url.includes("getDoctorsInfoForLI") || r.url.includes("getDoctorsInfo")) && r.responseBody?.payload?.doctorsInfo);
+      if (docReq && Array.isArray(docReq.responseBody.payload.doctorsInfo)) {
+        doctorsList = docReq.responseBody.payload.doctorsInfo;
+        doctorsMap[selectedAppt.id] = doctorsList;
+        doctorsMap["last"] = doctorsList;
+        chrome.storage.local.set({ doctorsInfoMap: doctorsMap });
+      }
+    }
+
+    // Fallback 3: Query active tab to fetch doctorsInfo via bridge
+    if (!doctorsList || !Array.isArray(doctorsList) || doctorsList.length === 0) {
+      try {
+        const tab = await getActiveEmiaTab();
+        if (tab) {
+          const res = await chrome.tabs.sendMessage(tab.id, {
+            type: "POPUP_FETCH_BRANCHES",
+            payload: { appointment: selectedAppt }
+          });
+          if (res && res.success && Array.isArray(res.doctorsInfo) && res.doctorsInfo.length > 0) {
+            doctorsList = res.doctorsInfo;
+          }
+        }
+      } catch (e) {
+        // Tab not responsive
+      }
+    }
+
     const branchesMap = new Map();
 
     // 1. Current appointment branch
