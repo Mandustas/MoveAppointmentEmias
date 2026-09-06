@@ -701,45 +701,92 @@
   }
 
   // -------------------------------------------------------------
-  // In-Page Floating UI & Indicators
+  // In-Page Floating UI & Indicators (Matches Popup Design)
   // -------------------------------------------------------------
   function updateFloatingCounter(count) {
-    const counterEl = document.getElementById("emias-req-counter");
+    const counterEl = document.getElementById("requests-count");
     if (counterEl) {
-      counterEl.innerText = `${count} запросов`;
+      counterEl.textContent = String(count);
+    }
+    const snifferTab = document.getElementById("tab-sniffer");
+    if (snifferTab && snifferTab.classList.contains("active")) {
+      loadDrawerRequests();
     }
   }
 
   function updateStatusUi(text, isSuccess = false) {
-    const statusEl = document.getElementById("emias-monitor-status");
-    if (statusEl) {
-      statusEl.innerText = text;
-      statusEl.style.color = isSuccess ? "#16a34a" : "#2d3748";
+    const badgeEl = document.getElementById("monitor-badge");
+    const detailEl = document.getElementById("monitor-detail");
+    if (detailEl) detailEl.textContent = text;
+    if (badgeEl && isSuccess) {
+      badgeEl.textContent = "🟢 Перенесено!";
+      badgeEl.style.color = "#16a34a";
     }
   }
 
   function updateCountdownUi(seconds) {
-    const cdEl = document.getElementById("emias-monitor-countdown");
-    if (cdEl) {
-      cdEl.innerText = seconds > 0 ? `(след. через ${seconds}с)` : "";
+    const counterEl = document.getElementById("monitor-counter");
+    if (counterEl) {
+      counterEl.textContent = seconds > 0 ? `(след. через ${seconds}с)` : "";
     }
   }
 
   function renderMiniLogUi(logs) {
-    const logContainer = document.getElementById("emias-mini-log");
+    const logContainer = document.getElementById("popup-log-list");
     if (!logContainer) return;
     if (!logs || logs.length === 0) {
-      logContainer.innerHTML = `<div style="color:#94a3b8;text-align:center;padding:8px;font-size:11px;">История действий пуста</div>`;
+      logContainer.innerHTML = '<div class="empty-state">История проверок пока пуста</div>';
       return;
     }
-    logContainer.innerHTML = logs.slice().reverse().slice(0, 8).map(l => {
-      const color = l.type === "success" ? "#16a34a" : (l.type === "match" ? "#0284c7" : (l.type === "error" ? "#dc2626" : "#475569"));
+    logContainer.innerHTML = logs.slice().reverse().map(l => {
+      const cls = l.type === "success" ? "log-success" : (l.type === "match" ? "log-match" : (l.type === "error" ? "log-error" : (l.type === "stop" ? "log-stop" : "log-info")));
       return `
-        <div style="font-size: 11px; margin-bottom: 4px; line-height: 1.3; color: ${color}; border-bottom: 1px dashed #e2e8f0; padding-bottom: 3px;">
-          <span style="color: #94a3b8; font-size: 10px;">${l.time}</span> ${l.text}
+        <div class="log-item ${cls}">
+          <span class="log-time">${l.time}</span> ${l.text}
         </div>
       `;
     }).join("");
+  }
+
+  async function loadDrawerRequests() {
+    const data = await chrome.storage.local.get("capturedRequests");
+    const list = data.capturedRequests || [];
+    const countEl = document.getElementById("requests-count");
+    if (countEl) countEl.textContent = list.length;
+
+    const container = document.getElementById("requests-container");
+    if (!container) return;
+
+    if (list.length === 0) {
+      container.innerHTML = '<div class="empty-state">Ожидание сетевой активности на emias.info...</div>';
+      return;
+    }
+
+    container.innerHTML = list.slice().reverse().map(r => {
+      const isGet = r.method === "GET";
+      const isPost = r.method === "POST";
+      const badgeCls = isGet ? "req-get" : (isPost ? "req-post" : "req-other");
+      const urlShort = r.url.length > 52 ? r.url.substring(0, 49) + "..." : r.url;
+      const timeStr = r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : "";
+
+      return `
+        <div class="req-item">
+          <div class="req-header">
+            <span class="req-badge ${badgeCls}">${r.method}</span>
+            <span class="req-time">${timeStr}</span>
+          </div>
+          <div class="req-url" title="${r.url}">${urlShort}</div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  function showFloatingToast(text, duration = 2200) {
+    let toast = document.getElementById("floating-toast");
+    if (!toast) return;
+    toast.textContent = text;
+    toast.classList.remove("hidden");
+    setTimeout(() => toast.classList.add("hidden"), duration);
   }
 
   async function renderFloatingUi() {
@@ -750,207 +797,977 @@
       document.body.appendChild(container);
     }
 
+    const oldDrawer = document.getElementById("emias-drawer");
+    const wasDrawerOpen = oldDrawer ? oldDrawer.style.display === "flex" : false;
+    const activeTabId = oldDrawer?.querySelector(".tab-btn.active")?.getAttribute("data-tab") || "tab-control";
+
     const store = await chrome.storage.local.get([
       "monitoringActive",
       "monitoringConfig",
       "appointments",
       "patientContext",
       "monitoringLogs",
-      "transferMode"
+      "transferMode",
+      "tgToken",
+      "tgChatId",
+      "capturedRequests"
     ]);
 
     const isMonitoring = Boolean(store.monitoringActive);
     const appointments = store.appointments || [];
     const hasAppointments = appointments.length > 0;
     const transferMode = store.transferMode || "semi";
+    const config = store.monitoringConfig || {};
 
-    const selectedApptId = store.monitoringConfig?.appointmentId || (appointments[0] ? appointments[0].id : null);
+    const selectedApptId = config.appointmentId || (appointments[0] ? appointments[0].id : null);
     const currentAppt = appointments.find(a => String(a.id) === String(selectedApptId)) || appointments[0] || null;
+
+    let targetDtVal = config.targetDatetime || "";
+    if (!targetDtVal) {
+      const d = new Date();
+      d.setDate(d.getDate() + 1);
+      d.setHours(10, 0, 0, 0);
+      targetDtVal = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    }
 
     container.innerHTML = `
       <style>
+        #emias-assistant-root {
+          all: initial;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+          z-index: 9999999;
+          position: relative;
+        }
+        #emias-assistant-root * {
+          box-sizing: border-box;
+          margin: 0;
+          padding: 0;
+          font-family: inherit;
+        }
         @keyframes emiasPulse {
           0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
-          70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(34, 197, 94, 0); }
+          70% { transform: scale(1); box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); }
           100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
         }
-        .emias-live-dot {
+        #emias-assistant-root .live-pulse {
           width: 8px;
           height: 8px;
           border-radius: 50%;
           background: #22c55e;
           display: inline-block;
           animation: emiasPulse 1.8s infinite;
+          flex-shrink: 0;
         }
-      </style>
+        #emias-assistant-root .live-pulse.hidden {
+          display: none !important;
+        }
 
-      <div id="emias-badge-btn" style="
-        position: fixed;
-        bottom: 24px;
-        right: 24px;
-        z-index: 999999;
-        background: ${isMonitoring ? "linear-gradient(135deg, #15803d, #166534)" : "linear-gradient(135deg, #00897B, #004D40)"};
-        color: white;
-        padding: 10px 16px;
-        border-radius: 28px;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        font-size: 13px;
-        font-weight: 600;
-        box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        user-select: none;
-      ">
-        ${isMonitoring ? '<span class="emias-live-dot"></span>' : '<span style="font-size: 16px;">🩺</span>'}
-        <span>${isMonitoring ? "Мониторинг активен" : "ЕМИАС Автоперенос"}</span>
-        <span id="emias-req-counter" style="
+        #emias-badge-btn {
+          position: fixed;
+          bottom: 24px;
+          right: 24px;
+          z-index: 999999;
+          background: ${isMonitoring ? "linear-gradient(135deg, #15803d, #166534)" : "linear-gradient(135deg, #00897B, #004D40)"};
+          color: white;
+          padding: 10px 16px;
+          border-radius: 28px;
+          font-size: 13px;
+          font-weight: 600;
+          box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          user-select: none;
+          transition: transform 0.15s ease, box-shadow 0.15s ease;
+        }
+        #emias-badge-btn:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 6px 22px rgba(0, 0, 0, 0.3);
+        }
+        #emias-badge-tag {
           background: rgba(255, 255, 255, 0.25);
           padding: 2px 8px;
           border-radius: 12px;
           font-size: 11px;
-        ">${isMonitoring ? "Поиск..." : (hasAppointments ? `${appointments.length} зап.` : "Готов")}</span>
+        }
+
+        #emias-drawer {
+          display: none;
+          position: fixed;
+          bottom: 76px;
+          right: 24px;
+          width: 420px;
+          height: 600px;
+          max-height: calc(100vh - 100px);
+          background-color: #f8fafc;
+          color: #1e293b;
+          border-radius: 12px;
+          box-shadow: 0 16px 44px rgba(0, 0, 0, 0.28);
+          border: 1px solid #cbd5e1;
+          flex-direction: column;
+          overflow: hidden;
+          z-index: 999999;
+        }
+
+        #emias-drawer .header {
+          background: linear-gradient(135deg, #00897B, #004D40);
+          color: white;
+          padding: 11px 14px;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          flex-shrink: 0;
+        }
+        #emias-drawer .logo-area {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+        #emias-drawer .logo-icon {
+          font-size: 22px;
+        }
+        #emias-drawer .title {
+          font-size: 14px;
+          font-weight: 700;
+          letter-spacing: -0.2px;
+          line-height: 1.2;
+        }
+        #emias-drawer .version {
+          font-size: 10px;
+          opacity: 0.85;
+        }
+        #emias-drawer .status-pill {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          padding: 4px 10px;
+          border-radius: 12px;
+          font-size: 11px;
+          font-weight: 500;
+          background: rgba(255, 255, 255, 0.15);
+        }
+        #emias-drawer .status-pill .dot {
+          width: 7px;
+          height: 7px;
+          border-radius: 50%;
+          background-color: #4ade80;
+          box-shadow: 0 0 6px #4ade80;
+        }
+        #emias-drawer .close-btn {
+          background: none;
+          border: none;
+          color: white;
+          font-size: 18px;
+          cursor: pointer;
+          padding: 2px 6px;
+          border-radius: 4px;
+          opacity: 0.85;
+          line-height: 1;
+        }
+        #emias-drawer .close-btn:hover {
+          opacity: 1;
+          background: rgba(255, 255, 255, 0.2);
+        }
+
+        #emias-drawer .tabs {
+          display: flex;
+          background: #ffffff;
+          border-bottom: 1px solid #e2e8f0;
+          flex-shrink: 0;
+        }
+        #emias-drawer .tab-btn {
+          flex: 1;
+          background: none;
+          border: none;
+          padding: 10px 4px;
+          font-size: 11.5px;
+          font-weight: 600;
+          color: #64748b;
+          cursor: pointer;
+          transition: all 0.15s;
+          border-bottom: 2px solid transparent;
+          text-align: center;
+        }
+        #emias-drawer .tab-btn:hover {
+          color: #0f172a;
+          background: #f1f5f9;
+        }
+        #emias-drawer .tab-btn.active {
+          color: #00897B;
+          border-bottom-color: #00897B;
+        }
+
+        #emias-drawer .tab-content {
+          display: none;
+          padding: 14px 16px;
+          flex: 1;
+          overflow-y: auto;
+        }
+        #emias-drawer .tab-content.active {
+          display: block;
+        }
+
+        #emias-drawer .tab-warning {
+          background: #fffbeb;
+          border: 1px solid #fef3c7;
+          border-radius: 8px;
+          padding: 8px 10px;
+          font-size: 11px;
+          color: #92400e;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin-bottom: 12px;
+          line-height: 1.35;
+        }
+
+        #emias-drawer .monitor-card {
+          border-radius: 8px;
+          padding: 10px 12px;
+          margin-bottom: 12px;
+          border: 1px solid #e2e8f0;
+        }
+        #emias-drawer .monitor-card.inactive {
+          background: #f1f5f9;
+        }
+        #emias-drawer .monitor-card.active {
+          background: #f0fdf4;
+          border-color: #bbf7d0;
+        }
+        #emias-drawer .monitor-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 4px;
+        }
+        #emias-drawer .badge {
+          font-weight: 600;
+          font-size: 12px;
+        }
+        #emias-drawer .subtext {
+          font-size: 11px;
+          color: #64748b;
+        }
+        #emias-drawer .monitor-detail {
+          font-size: 11px;
+          color: #334155;
+          line-height: 1.35;
+        }
+
+        #emias-drawer .rich-card {
+          background: white;
+          border: 1px solid #cbd5e1;
+          border-radius: 8px;
+          padding: 10px 12px;
+          margin-top: 4px;
+          box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+        }
+        #emias-drawer .rich-card-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 4px;
+        }
+        #emias-drawer .rich-badge {
+          font-size: 10px;
+          font-weight: 700;
+          color: #00897B;
+          background: #e6fffa;
+          padding: 2px 6px;
+          border-radius: 4px;
+        }
+        #emias-drawer .rich-sub {
+          font-size: 11px;
+          color: #64748b;
+        }
+        #emias-drawer .rich-title {
+          font-weight: 700;
+          font-size: 13px;
+          color: #0f172a;
+          margin-bottom: 4px;
+        }
+        #emias-drawer .rich-time {
+          font-size: 11px;
+          font-weight: 600;
+          color: #1e293b;
+          margin-bottom: 2px;
+        }
+        #emias-drawer .rich-lpu {
+          font-size: 11px;
+          color: #64748b;
+        }
+        #emias-drawer .form-select-inline {
+          padding: 4px 8px;
+          border-radius: 6px;
+          border: 1px solid #cbd5e1;
+          font-size: 11px;
+          outline: none;
+          background: white;
+          max-width: 170px;
+          color: #0f172a;
+        }
+
+        #emias-drawer .mode-selector {
+          display: flex;
+          gap: 8px;
+        }
+        #emias-drawer .mode-pill {
+          flex: 1;
+          border: 1px solid #cbd5e1;
+          background: white;
+          border-radius: 8px;
+          padding: 8px 10px;
+          cursor: pointer;
+          display: flex;
+          align-items: flex-start;
+          gap: 8px;
+          transition: all 0.15s;
+        }
+        #emias-drawer .mode-pill input {
+          margin-top: 3px;
+        }
+        #emias-drawer .mode-pill.selected {
+          border-color: #00897B;
+          background: #f0fdfa;
+        }
+        #emias-drawer .mode-title {
+          font-size: 12px;
+          font-weight: 600;
+          color: #0f172a;
+        }
+        #emias-drawer .mode-desc {
+          font-size: 10px;
+          color: #64748b;
+          line-height: 1.25;
+          margin-top: 2px;
+        }
+
+        #emias-drawer .form-group {
+          margin-bottom: 12px;
+        }
+        #emias-drawer .form-row {
+          display: flex;
+          gap: 10px;
+          align-items: flex-start;
+        }
+        #emias-drawer .checkbox-cell {
+          display: flex;
+          align-items: center;
+          padding-top: 24px;
+        }
+        #emias-drawer .form-label {
+          display: block;
+          font-size: 12px;
+          font-weight: 600;
+          color: #334155;
+          margin-bottom: 4px;
+        }
+        #emias-drawer .form-input, #emias-drawer .form-select {
+          width: 100%;
+          padding: 8px 10px;
+          border-radius: 6px;
+          border: 1px solid #cbd5e1;
+          font-size: 12px;
+          color: #0f172a;
+          outline: none;
+          background: white;
+        }
+        #emias-drawer .form-input:focus, #emias-drawer .form-select:focus {
+          border-color: #00897B;
+          box-shadow: 0 0 0 2px rgba(0, 137, 123, 0.15);
+        }
+        #emias-drawer .form-hint {
+          display: block;
+          font-size: 11px;
+          color: #64748b;
+          margin-top: 3px;
+        }
+        #emias-drawer .checkbox-label {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 11px;
+          cursor: pointer;
+          user-select: none;
+          color: #334155;
+        }
+
+        #emias-drawer .branch-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 6px;
+        }
+        #emias-drawer .branch-actions {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+        #emias-drawer .branch-sep {
+          color: #cbd5e1;
+          font-size: 11px;
+        }
+        #emias-drawer .branch-list {
+          background: white;
+          border: 1px solid #cbd5e1;
+          border-radius: 8px;
+          padding: 6px;
+          max-height: 140px;
+          overflow-y: auto;
+          display: flex;
+          flex-direction: column;
+          gap: 5px;
+        }
+        #emias-drawer .branch-item {
+          display: flex;
+          align-items: flex-start;
+          gap: 8px;
+          padding: 6px 8px;
+          border-radius: 6px;
+          background: #f8fafc;
+          border: 1px solid #f1f5f9;
+          cursor: pointer;
+          transition: background-color 0.15s;
+        }
+        #emias-drawer .branch-item:hover {
+          background: #f0fdfa;
+          border-color: #ccfbf1;
+        }
+        #emias-drawer .branch-item input[type="checkbox"] {
+          margin-top: 3px;
+          accent-color: #00897B;
+          cursor: pointer;
+        }
+        #emias-drawer .branch-item-info {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          flex: 1;
+        }
+        #emias-drawer .branch-item-name {
+          font-size: 11px;
+          font-weight: 600;
+          color: #0f172a;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+        #emias-drawer .branch-current-tag {
+          font-size: 9px;
+          font-weight: 700;
+          color: #00897B;
+          background: #e6fffa;
+          padding: 1px 5px;
+          border-radius: 4px;
+          text-transform: uppercase;
+        }
+        #emias-drawer .branch-item-address {
+          font-size: 10px;
+          color: #64748b;
+          line-height: 1.25;
+        }
+        #emias-drawer .branch-empty {
+          font-size: 11px;
+          color: #64748b;
+          padding: 10px 8px;
+          text-align: center;
+        }
+
+        #emias-drawer .button-row {
+          display: flex;
+          gap: 8px;
+          margin-top: 6px;
+          margin-bottom: 12px;
+        }
+        #emias-drawer .btn {
+          border: none;
+          border-radius: 6px;
+          padding: 8px 12px;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 4px;
+        }
+        #emias-drawer .btn-primary {
+          background: #00897B;
+          color: white;
+          flex: 1.2;
+        }
+        #emias-drawer .btn-primary:hover {
+          background: #00796B;
+        }
+        #emias-drawer .btn-secondary {
+          background: #e2e8f0;
+          color: #334155;
+          flex: 1;
+        }
+        #emias-drawer .btn-secondary:hover {
+          background: #cbd5e1;
+        }
+        #emias-drawer .btn-danger {
+          background: #dc2626 !important;
+          color: white !important;
+        }
+        #emias-drawer .btn-danger:hover {
+          background: #b91c1c !important;
+        }
+        #emias-drawer .btn-text {
+          background: none;
+          border: none;
+          color: #00897B;
+          font-size: 11px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+
+        #emias-drawer .slots-box {
+          background: white;
+          border: 1px solid #e2e8f0;
+          border-radius: 8px;
+          padding: 10px;
+          margin-top: 10px;
+          max-height: 160px;
+          overflow-y: auto;
+        }
+        #emias-drawer .slots-box.hidden {
+          display: none;
+        }
+        #emias-drawer .slots-list {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+        #emias-drawer .slot-card {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 6px;
+          padding: 6px 8px;
+        }
+        #emias-drawer .slot-time {
+          font-weight: 700;
+          font-size: 13px;
+          color: #0f172a;
+        }
+        #emias-drawer .slot-meta {
+          font-size: 10px;
+          color: #64748b;
+        }
+        #emias-drawer .slot-delta {
+          font-size: 10px;
+          background: #e0f2fe;
+          color: #0284c7;
+          padding: 1px 5px;
+          border-radius: 4px;
+          font-weight: 600;
+        }
+        #emias-drawer .slot-shift-btn {
+          background: #00897B;
+          color: white;
+          border: none;
+          padding: 4px 8px;
+          border-radius: 4px;
+          font-size: 11px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+
+        #emias-drawer .mini-log-list {
+          background: white;
+          border: 1px solid #e2e8f0;
+          border-radius: 8px;
+          padding: 8px;
+          max-height: 380px;
+          overflow-y: auto;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+        #emias-drawer .log-item {
+          font-size: 11px;
+          line-height: 1.35;
+          padding-bottom: 4px;
+          border-bottom: 1px dashed #f1f5f9;
+        }
+        #emias-drawer .log-time {
+          color: #94a3b8;
+          font-size: 10px;
+          font-family: monospace;
+        }
+        #emias-drawer .log-info { color: #475569; }
+        #emias-drawer .log-match { color: #0284c7; font-weight: 600; }
+        #emias-drawer .log-success { color: #16a34a; font-weight: 600; }
+        #emias-drawer .log-error { color: #dc2626; }
+        #emias-drawer .log-stop { color: #d97706; }
+
+        #emias-drawer .info-card {
+          background: #f0fdfa;
+          border: 1px solid #ccfbf1;
+          border-radius: 8px;
+          padding: 10px 12px;
+          display: flex;
+          gap: 8px;
+          margin-bottom: 12px;
+        }
+        #emias-drawer .info-text {
+          font-size: 12px;
+          color: #134e4a;
+        }
+        #emias-drawer .stats-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          background: white;
+          padding: 10px 12px;
+          border-radius: 8px;
+          border: 1px solid #e2e8f0;
+          margin-bottom: 12px;
+        }
+        #emias-drawer .stat-value {
+          font-size: 20px;
+          font-weight: 700;
+          color: #00897B;
+        }
+        #emias-drawer .requests-list {
+          background: white;
+          border: 1px solid #e2e8f0;
+          border-radius: 8px;
+          max-height: 320px;
+          overflow-y: auto;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          padding: 8px;
+        }
+        #emias-drawer .req-item {
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 6px;
+          padding: 8px;
+        }
+        #emias-drawer .req-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 4px;
+        }
+        #emias-drawer .req-badge {
+          font-size: 10px;
+          font-weight: 700;
+          padding: 1px 5px;
+          border-radius: 3px;
+          color: white;
+        }
+        #emias-drawer .req-get { background: #2563eb; }
+        #emias-drawer .req-post { background: #16a34a; }
+        #emias-drawer .req-other { background: #d97706; }
+        #emias-drawer .req-time {
+          font-size: 10px;
+          color: #94a3b8;
+        }
+        #emias-drawer .req-url {
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+          font-size: 11px;
+          color: #0f172a;
+          word-break: break-all;
+        }
+        #emias-drawer .empty-state {
+          text-align: center;
+          color: #94a3b8;
+          padding: 24px 12px;
+          font-size: 12px;
+        }
+        #emias-drawer .status-msg {
+          font-size: 11px;
+          margin-top: 6px;
+          min-height: 16px;
+        }
+        #emias-drawer .status-msg.success { color: #16a34a; }
+        #emias-drawer .status-msg.error { color: #dc2626; }
+
+        #emias-assistant-root .toast {
+          position: fixed;
+          bottom: 24px;
+          left: 50%;
+          transform: translateX(-50%);
+          background: #1e293b;
+          color: white;
+          padding: 8px 16px;
+          border-radius: 20px;
+          font-size: 12px;
+          box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+          transition: opacity 0.2s ease, transform 0.2s ease;
+          z-index: 10000000;
+        }
+        #emias-assistant-root .toast.hidden {
+          opacity: 0;
+          pointer-events: none;
+          transform: translateX(-50%) translateY(10px);
+        }
+      </style>
+
+      <div id="emias-badge-btn">
+        ${isMonitoring ? '<span class="live-pulse"></span>' : '<span style="font-size: 16px;">🩺</span>'}
+        <span>${isMonitoring ? "Мониторинг активен" : "ЕМИАС Автоперенос"}</span>
+        <span id="emias-badge-tag">${isMonitoring ? "Поиск..." : (hasAppointments ? `${appointments.length} зап.` : "Готов")}</span>
       </div>
 
-      <div id="emias-drawer" style="
-        display: none;
-        position: fixed;
-        bottom: 76px;
-        right: 24px;
-        width: 400px;
-        max-height: 560px;
-        background: #ffffff;
-        color: #1e293b;
-        border-radius: 14px;
-        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.25);
-        z-index: 999999;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        font-size: 13px;
-        overflow: hidden;
-        border: 1px solid #e2e8f0;
-        flex-direction: column;
-      ">
-        <div style="background: #00897B; color: white; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center;">
-          <div style="font-weight: 700; display: flex; align-items: center; gap: 8px;">
-            ${isMonitoring ? '<span class="emias-live-dot"></span>' : '<span>🩺</span>'}
-            <span>ЕМИАС Автоперенос</span>
+      <div id="emias-drawer">
+        <!-- Header -->
+        <div class="header">
+          <div class="logo-area">
+            <span class="logo-icon">🩺</span>
+            <div>
+              <div class="title">ЕМИАС Автоперенос</div>
+              <span class="version">v1.2.2 (Полуавтомат + TG)</span>
+            </div>
           </div>
-          <button id="emias-drawer-close" style="background: none; border: none; color: white; cursor: pointer; font-size: 16px;">✕</button>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <div class="status-pill status-connected">
+              <span class="dot"></span>
+              <span class="status-text">ЕМИАС подключен</span>
+            </div>
+            <button id="emias-drawer-close" class="close-btn" title="Закрыть">✕</button>
+          </div>
         </div>
 
-        <div style="padding: 14px 16px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 10px;">
+        <!-- Navigation Tabs -->
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="tab-control">⚡ Перенос</button>
+          <button class="tab-btn" data-tab="tab-log">📜 Журнал</button>
+          <button class="tab-btn" data-tab="tab-telegram">📱 Telegram</button>
+          <button class="tab-btn" data-tab="tab-sniffer">🔍 API</button>
+        </div>
+
+        <!-- Tab 1: Control & Reschedule -->
+        <div id="tab-control" class="tab-content active">
           <!-- Closing tab warning notice -->
-          <div style="background: #fffbeb; border: 1px solid #fef3c7; border-radius: 8px; padding: 8px 10px; font-size: 11px; color: #92400e; display: flex; gap: 6px; align-items: center;">
-            <span>💡</span>
+          <div class="tab-warning">
+            <span style="font-size: 14px;">💡</span>
             <span>Для работы автопоиска держите вкладку ЕМИАС открытой (её можно свернуть).</span>
           </div>
 
-          <!-- Status Banner -->
-          <div style="background: ${isMonitoring ? "#f0fdf4" : "#f8fafc"}; border: 1px solid ${isMonitoring ? "#bbf7d0" : "#e2e8f0"}; border-radius: 8px; padding: 10px 12px;">
-            <div style="display: flex; justify-content: space-between; font-weight: 600; font-size: 12px; margin-bottom: 4px;">
-              <span style="display:flex; align-items:center; gap:6px;">
-                ${isMonitoring ? '<span class="emias-live-dot"></span>' : '<span>⚪</span>'}
-                <span>Статус: ${isMonitoring ? "Автопоиск запущен" : "Ожидание"}</span>
-              </span>
-              <span id="emias-monitor-countdown" style="color: #64748b; font-weight: normal;"></span>
+          <!-- Live Monitor Status Card -->
+          <div id="monitor-status-card" class="monitor-card ${isMonitoring ? "active" : "inactive"}">
+            <div class="monitor-header">
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <span id="monitor-pulse-dot" class="live-pulse ${isMonitoring ? "" : "hidden"}"></span>
+                <span id="monitor-badge" class="badge" style="color: ${isMonitoring ? "#15803d" : "#475569"};">
+                  ${isMonitoring ? "Автопоиск запущен" : "⚪ Мониторинг выключен"}
+                </span>
+              </div>
+              <span id="monitor-counter" class="subtext"></span>
             </div>
-            <div id="emias-monitor-status" style="font-size: 11px; color: #475569; line-height: 1.3;">
-              ${isMonitoring ? "Отслеживание слотов в процессе..." : "Выберите параметры и нажмите «Запустить автопоиск»"}
+            <div id="monitor-detail" class="monitor-detail">
+              ${isMonitoring ? "Режим: " + (transferMode === "semi" ? "Полуавтомат (кнопка в TG)" : "Полный автомат") + ". Опрос каждые 20-30с со случайным разбросом." : "Выберите параметры и запустите поиск или проверьте слоты прямо сейчас."}
             </div>
           </div>
 
           <!-- Rich Appointment Card -->
-          ${currentAppt ? `
-            <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px 12px;">
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-                <span style="font-size: 10px; font-weight: 700; color: #00897B; background: #e6fffa; padding: 1px 6px; border-radius: 4px;">${currentAppt.number || "АКТИВНАЯ ЗАПИСЬ"}</span>
-                <span style="font-size: 10px; color: #64748b;">${appointments.length > 1 ? `1 из ${appointments.length} записей` : ""}</span>
-              </div>
-              <div style="font-weight: 700; font-size: 13px; color: #0f172a; margin-bottom: 4px;">
-                🩺 ${currentAppt.toBM ? currentAppt.toBM.name : (currentAppt.specialityName || "Приём")}
-              </div>
-              <div style="font-size: 11px; color: #334155; margin-bottom: 2px;">
-                📅 <b>${new Date(currentAppt.startTime).toLocaleDateString("ru-RU")} в ${new Date(currentAppt.startTime).toLocaleTimeString("ru-RU", {hour:"2-digit",minute:"2-digit"})}</b>
-              </div>
-              <div style="font-size: 11px; color: #64748b;">
-                📍 ${currentAppt.nameLpu} (${currentAppt.roomNumber || ""})
-              </div>
+          <div class="form-group">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+              <label class="form-label" style="margin-bottom: 0;">Запись для переноса:</label>
+              <select id="appointment-select" class="form-select-inline">
+                ${appointments.length === 0 ? '<option value="">Нет сохраненных записей</option>' : appointments.map((a, idx) => {
+                  const title = a.toBM ? a.toBM.name : (a.specialityName || "Приём");
+                  const dStr = formatDate(a.startTime);
+                  const tStr = formatTime(a.startTime);
+                  return `<option value="${a.id}" ${String(a.id) === String(selectedApptId) ? "selected" : ""}>Запись #${idx + 1} (${title} · ${dStr} ${tStr})</option>`;
+                }).join("")}
+              </select>
             </div>
-          ` : `
-            <div style="color: #64748b; font-size: 11px; text-align: center; padding: 8px;">Ожидание загрузки записей...</div>
-          `}
 
-          <!-- Hidden select for form value -->
-          <input type="hidden" id="emias-appt-select" value="${currentAppt ? currentAppt.id : ""}">
+            <div id="rich-appointment-card" class="rich-card">
+              ${currentAppt ? `
+                <div class="rich-card-header">
+                  <span id="card-appt-num" class="rich-badge">${currentAppt.number || "АКТИВНАЯ ЗАПИСЬ"}</span>
+                  <span id="card-appt-branch-short" class="rich-sub">${currentAppt.nameLpu ? currentAppt.nameLpu.split(" ").slice(-2).join(" ") : ""}</span>
+                </div>
+                <div id="card-appt-title" class="rich-title">🩺 ${currentAppt.toBM ? currentAppt.toBM.name : (currentAppt.specialityName || "Приём врача")}</div>
+                <div id="card-appt-time" class="rich-time">📅 ${formatDateTimeNice(currentAppt.startTime)}</div>
+                <div id="card-appt-lpu" class="rich-lpu">📍 ${currentAppt.nameLpu || "Поликлиника"} (${currentAppt.roomNumber || ""})</div>
+              ` : `
+                <div class="rich-title" style="color: #64748b; font-weight: normal; text-align: center; padding: 6px;">🩺 Откройте emias.info для загрузки записей</div>
+              `}
+            </div>
+          </div>
+
+          <!-- Mode selection pills -->
+          <div class="form-group">
+            <label class="form-label">Режим бронирования:</label>
+            <div class="mode-selector">
+              <label class="mode-pill ${transferMode === "semi" ? "selected" : ""}">
+                <input type="radio" name="drawer-transfer-mode" value="semi" ${transferMode === "semi" ? "checked" : ""}>
+                <div>
+                  <div class="mode-title">📲 Полуавтомат (TG)</div>
+                  <div class="mode-desc">Присылает кнопку подтверждения на телефон</div>
+                </div>
+              </label>
+              <label class="mode-pill ${transferMode === "auto" ? "selected" : ""}">
+                <input type="radio" name="drawer-transfer-mode" value="auto" ${transferMode === "auto" ? "checked" : ""}>
+                <div>
+                  <div class="mode-title">⚡ Полный автомат</div>
+                  <div class="mode-desc">Мгновенный перенос без вопросов</div>
+                </div>
+              </label>
+            </div>
+          </div>
 
           <!-- Target datetime -->
-          <div>
-            <label style="display: block; font-weight: 600; font-size: 11px; margin-bottom: 3px;">Желаемое время приёма:</label>
-            <input type="datetime-local" id="emias-target-dt" style="width: 100%; padding: 7px 9px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 12px; box-sizing: border-box;" value="${store.monitoringConfig?.targetDatetime || ""}">
+          <div class="form-group">
+            <label class="form-label">Желаемое целевое время:</label>
+            <input type="datetime-local" id="target-datetime" class="form-input" value="${targetDtVal}">
+            <span class="form-hint">Система ищет слоты с наименьшим отклонением от этой даты и времени</span>
           </div>
 
-          <!-- Tolerance window & mode -->
-          <div style="display: flex; gap: 8px;">
-            <div style="flex: 1;">
-              <label style="display: block; font-weight: 600; font-size: 11px; margin-bottom: 3px;">Окно времени:</label>
-              <select id="emias-window-select" style="width: 100%; padding: 6px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 12px;">
-                <option value="15">±15 минут</option>
-                <option value="30">±30 минут</option>
-                <option value="60" selected>±1 час</option>
-                <option value="120">±2 часа</option>
-                <option value="any">Весь день</option>
-              </select>
-            </div>
-            <div style="flex: 1;">
-              <label style="display: block; font-weight: 600; font-size: 11px; margin-bottom: 3px;">Режим бронирования:</label>
-              <select id="emias-mode-select" style="width: 100%; padding: 6px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 12px; font-weight: 600; color: #00897B;">
-                <option value="semi" ${transferMode === "semi" ? "selected" : ""}>📲 Полуавтомат (кнопка в TG)</option>
-                <option value="auto" ${transferMode === "auto" ? "selected" : ""}>⚡ Полный автомат</option>
-              </select>
+          <!-- Tolerance window & Any doctor row -->
+          <div class="form-group">
+            <div class="form-row">
+              <div style="flex: 1.4;">
+                <label class="form-label">Окно допуска:</label>
+                <select id="time-window" class="form-select">
+                  <option value="15" ${config.timeWindow === "15" ? "selected" : ""}>±15 минут</option>
+                  <option value="30" ${config.timeWindow === "30" ? "selected" : ""}>±30 минут</option>
+                  <option value="60" ${config.timeWindow === "60" || !config.timeWindow ? "selected" : ""}>±1 час</option>
+                  <option value="120" ${config.timeWindow === "120" ? "selected" : ""}>±2 часа</option>
+                  <option value="any" ${config.timeWindow === "any" ? "selected" : ""}>Весь день</option>
+                </select>
+              </div>
+              <div class="checkbox-cell" style="flex: 1;">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="any-doctor" ${config.anyDoctor !== false ? "checked" : ""}>
+                  <span>Любой врач</span>
+                </label>
+              </div>
             </div>
           </div>
 
-          <!-- Found Slots Preview -->
-          <div id="emias-slots-preview" style="display: none; background: #f1f5f9; border-radius: 8px; padding: 8px; max-height: 120px; overflow-y: auto;"></div>
+          <!-- Branch Selection Container -->
+          <div id="branch-selection-container" class="form-group">
+            <div class="branch-header">
+              <label class="form-label" style="margin-bottom: 0;">🏥 Подходящие филиалы:</label>
+              <div class="branch-actions">
+                <button type="button" id="branch-select-all-btn" class="btn-text">Выбрать все</button>
+                <span class="branch-sep">|</span>
+                <button type="button" id="branch-deselect-all-btn" class="btn-text">Снять все</button>
+              </div>
+            </div>
+            <div id="branch-list" class="branch-list">
+              <div class="branch-empty">Загрузка филиалов...</div>
+            </div>
+            <span class="form-hint">Слоты будут искаться только в отмеченных филиалах</span>
+          </div>
 
-          <!-- Actions -->
-          <div style="display: flex; gap: 8px;">
-            <button id="emias-find-btn" style="flex: 1; background: #e2e8f0; color: #1e293b; border: none; padding: 9px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 12px;">
-              🔍 Проверить сейчас
+          <!-- Action buttons -->
+          <div class="button-row">
+            <button id="find-now-btn" class="btn btn-secondary">🔍 Найти слоты сейчас</button>
+            <button id="toggle-monitor-btn" class="btn ${isMonitoring ? "btn-danger" : "btn-primary"}">
+              ${isMonitoring ? "⏹️ Остановить поиск" : "🚀 Запустить автоперенос"}
             </button>
-            <button id="emias-toggle-monitor-btn" style="flex: 1.2; background: ${isMonitoring ? "#dc2626" : "#00897B"}; color: white; border: none; padding: 9px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 12px;">
-              ${isMonitoring ? "⏹️ Остановить поиск" : "🚀 Запустить автопоиск"}
-            </button>
           </div>
 
-          <!-- Mini Log -->
-          <div>
-            <div style="font-weight: 600; font-size: 11px; color: #64748b; margin-bottom: 4px; display: flex; justify-content: space-between;">
-              <span>История проверок (Mini-Log):</span>
-              <span style="font-size: 10px; cursor: pointer; color: #00897B;" id="emias-clear-log-btn">Очистить</span>
-            </div>
-            <div id="emias-mini-log" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 6px 8px; max-height: 90px; overflow-y: auto;"></div>
+          <!-- Slots preview box -->
+          <div id="quick-slots-container" class="slots-box hidden">
+            <div class="slots-title">Подходящие слоты:</div>
+            <div id="slots-list" class="slots-list"></div>
           </div>
         </div>
+
+        <!-- Tab 2: Logs -->
+        <div id="tab-log" class="tab-content">
+          <div class="log-header">
+            <span style="font-weight: 600; font-size: 12px; color: #475569;">История проверок:</span>
+            <button id="popup-clear-log-btn" class="btn-text">Очистить</button>
+          </div>
+          <div id="popup-log-list" class="mini-log-list"></div>
+        </div>
+
+        <!-- Tab 3: Telegram Settings -->
+        <div id="tab-telegram" class="tab-content">
+          <div class="info-card">
+            <span class="info-icon">💡</span>
+            <div class="info-text">
+              Создайте бота в <b>@BotFather</b> и скопируйте токен. Затем узнайте свой Chat ID в <b>@userinfobot</b>.
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Telegram Bot Token:</label>
+            <input type="password" id="tg-token" class="form-input" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ" value="${store.tgToken || ""}">
+            <span class="form-hint">Токен из диалога с ботом @BotFather</span>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Telegram Chat ID:</label>
+            <input type="text" id="tg-chat-id" class="form-input" placeholder="123456789" value="${store.tgChatId || ""}">
+            <span class="form-hint">Ваш ID (можно узнать у бота @userinfobot)</span>
+          </div>
+          <div class="button-row">
+            <button id="save-tg-btn" class="btn btn-primary">💾 Сохранить</button>
+            <button id="test-tg-btn" class="btn btn-secondary">🔔 Проверить связь</button>
+          </div>
+          <div id="tg-test-status" class="status-msg"></div>
+        </div>
+
+        <!-- Tab 4: API Sniffer -->
+        <div id="tab-sniffer" class="tab-content">
+          <div class="stats-row">
+            <div class="stat-box">
+              <span class="stat-label">Перехвачено запросов:</span>
+              <span id="requests-count" class="stat-value">${(store.capturedRequests || []).length}</span>
+            </div>
+            <div class="stat-actions">
+              <button id="copy-summary-btn" class="btn btn-primary" style="padding: 6px 10px; font-size: 11px;">📋 Скопировать</button>
+              <button id="clear-requests-btn" class="btn btn-secondary" style="padding: 6px 10px; font-size: 11px;">Очистить</button>
+            </div>
+          </div>
+          <div class="section-title">Журнал API:</div>
+          <div id="requests-container" class="requests-list"></div>
+        </div>
+
+        <!-- Footer Toast -->
+        <div id="floating-toast" class="toast hidden"></div>
       </div>
     `;
 
-    renderMiniLogUi(store.monitoringLogs || []);
-
-    // Bind events
+    // Elements
     const badgeBtn = document.getElementById("emias-badge-btn");
     const drawer = document.getElementById("emias-drawer");
     const closeBtn = document.getElementById("emias-drawer-close");
-    const findBtn = document.getElementById("emias-find-btn");
-    const toggleBtn = document.getElementById("emias-toggle-monitor-btn");
-    const apptSelect = document.getElementById("emias-appt-select");
-    const targetDtInput = document.getElementById("emias-target-dt");
-    const windowSelect = document.getElementById("emias-window-select");
-    const modeSelect = document.getElementById("emias-mode-select");
-    const previewContainer = document.getElementById("emias-slots-preview");
-    const clearLogBtn = document.getElementById("emias-clear-log-btn");
+    const tabButtons = drawer.querySelectorAll(".tab-btn");
+    const tabContents = drawer.querySelectorAll(".tab-content");
 
+    const apptSelect = document.getElementById("appointment-select");
+    const targetDtInput = document.getElementById("target-datetime");
+    const timeWindowSelect = document.getElementById("time-window");
+    const anyDoctorCb = document.getElementById("any-doctor");
+    const branchList = document.getElementById("branch-list");
+    const branchSelectAllBtn = document.getElementById("branch-select-all-btn");
+    const branchDeselectAllBtn = document.getElementById("branch-deselect-all-btn");
+    const modePills = drawer.querySelectorAll(".mode-pill");
+    const modeInputs = drawer.querySelectorAll("input[name='drawer-transfer-mode']");
+
+    const findNowBtn = document.getElementById("find-now-btn");
+    const toggleMonitorBtn = document.getElementById("toggle-monitor-btn");
+    const quickSlotsContainer = document.getElementById("quick-slots-container");
+    const slotsList = document.getElementById("slots-list");
+
+    const popupClearLogBtn = document.getElementById("popup-clear-log-btn");
+    const tgTokenInput = document.getElementById("tg-token");
+    const tgChatIdInput = document.getElementById("tg-chat-id");
+    const saveTgBtn = document.getElementById("save-tg-btn");
+    const testTgBtn = document.getElementById("test-tg-btn");
+    const tgTestStatus = document.getElementById("tg-test-status");
+
+    const copySummaryBtn = document.getElementById("copy-summary-btn");
+    const clearRequestsBtn = document.getElementById("clear-requests-btn");
+
+    // Drawer toggle
     badgeBtn.addEventListener("click", () => {
       drawer.style.display = drawer.style.display === "none" ? "flex" : "none";
     });
@@ -959,120 +1776,257 @@
       drawer.style.display = "none";
     });
 
-    modeSelect.addEventListener("change", async (e) => {
-      await chrome.storage.local.set({ transferMode: e.target.value });
+    // Tab switching
+    function switchTab(targetId) {
+      tabButtons.forEach(b => {
+        if (b.getAttribute("data-tab") === targetId) b.classList.add("active");
+        else b.classList.remove("active");
+      });
+      tabContents.forEach(c => {
+        if (c.id === targetId) c.classList.add("active");
+        else c.classList.remove("active");
+      });
+      if (targetId === "tab-log") {
+        chrome.storage.local.get("monitoringLogs").then(s => renderMiniLogUi(s.monitoringLogs || []));
+      }
+      if (targetId === "tab-sniffer") {
+        loadDrawerRequests();
+      }
+    }
+
+    tabButtons.forEach(btn => {
+      btn.addEventListener("click", () => {
+        switchTab(btn.getAttribute("data-tab"));
+      });
     });
 
-    clearLogBtn?.addEventListener("click", async () => {
-      await chrome.storage.local.set({ monitoringLogs: [] });
-      renderMiniLogUi([]);
+    // Render branches
+    async function loadBranchesForAppt(appt) {
+      if (!branchList) return;
+      if (!appt) {
+        branchList.innerHTML = '<div class="branch-empty">Нет выбранной записи</div>';
+        return;
+      }
+      const docsList = await getResilientDoctorsList(appt, true);
+      const branches = extractBranches(appt, docsList);
+
+      if (branches.length === 0) {
+        branchList.innerHTML = `
+          <div class="branch-empty">
+            <div>Филиалы не определены</div>
+            <div style="font-size: 10px; color: #94a3b8; margin-top: 3px;">💡 Откройте запись на сайте emias.info для загрузки филиалов</div>
+          </div>
+        `;
+        return;
+      }
+
+      const savedAllowed = store.monitoringConfig?.allowedLpuIds;
+      const fragment = document.createDocumentFragment();
+
+      branches.forEach(b => {
+        const isChecked = Array.isArray(savedAllowed)
+          ? savedAllowed.map(String).includes(b.lpuId)
+          : true;
+
+        const item = document.createElement("label");
+        item.className = "branch-item";
+        item.innerHTML = `
+          <input type="checkbox" class="branch-checkbox" value="${b.lpuId}" ${isChecked ? "checked" : ""}>
+          <div class="branch-item-info">
+            <div class="branch-item-name">
+              <span>${b.name}</span>
+              ${b.isCurrent ? '<span class="branch-current-tag">Текущий</span>' : ""}
+            </div>
+            ${b.address ? `<div class="branch-item-address">📍 ${b.address}</div>` : ""}
+          </div>
+        `;
+
+        const cb = item.querySelector(".branch-checkbox");
+        cb.addEventListener("change", async () => {
+          const checked = Array.from(branchList.querySelectorAll(".branch-checkbox:checked")).map(c => c.value);
+          const s = await chrome.storage.local.get("monitoringConfig");
+          const cfg = s.monitoringConfig || {};
+          cfg.allowedLpuIds = checked;
+          await chrome.storage.local.set({ monitoringConfig: cfg });
+        });
+
+        fragment.appendChild(item);
+      });
+
+      branchList.innerHTML = "";
+      branchList.appendChild(fragment);
+    }
+
+    await loadBranchesForAppt(currentAppt);
+
+    // Branch select all / deselect all
+    branchSelectAllBtn?.addEventListener("click", async () => {
+      branchList.querySelectorAll(".branch-checkbox").forEach(cb => { cb.checked = true; });
+      const checked = Array.from(branchList.querySelectorAll(".branch-checkbox:checked")).map(c => c.value);
+      const s = await chrome.storage.local.get("monitoringConfig");
+      const cfg = s.monitoringConfig || {};
+      cfg.allowedLpuIds = checked;
+      await chrome.storage.local.set({ monitoringConfig: cfg });
+      showFloatingToast("Выбраны все филиалы");
     });
 
-    findBtn.addEventListener("click", async () => {
-      findBtn.disabled = true;
-      findBtn.innerText = "Поиск...";
-      previewContainer.style.display = "block";
-      previewContainer.innerHTML = `<div style="text-align:center;color:#64748b;padding:8px;">Запрос расписания...</div>`;
+    branchDeselectAllBtn?.addEventListener("click", async () => {
+      branchList.querySelectorAll(".branch-checkbox").forEach(cb => { cb.checked = false; });
+      const s = await chrome.storage.local.get("monitoringConfig");
+      const cfg = s.monitoringConfig || {};
+      cfg.allowedLpuIds = [];
+      await chrome.storage.local.set({ monitoringConfig: cfg });
+      showFloatingToast("Все филиалы отключены");
+    });
+
+    // Appointment change
+    apptSelect?.addEventListener("change", async () => {
+      const selected = appointments.find(a => String(a.id) === String(apptSelect.value));
+      const s = await chrome.storage.local.get("monitoringConfig");
+      const cfg = s.monitoringConfig || {};
+      cfg.appointmentId = apptSelect.value;
+      await chrome.storage.local.set({ monitoringConfig: cfg });
+      renderFloatingUi();
+    });
+
+    // Mode selection
+    modeInputs.forEach(input => {
+      input.addEventListener("change", async () => {
+        modePills.forEach(p => p.classList.remove("selected"));
+        input.closest(".mode-pill").classList.add("selected");
+        await chrome.storage.local.set({ transferMode: input.value });
+      });
+    });
+
+    // Find now button
+    findNowBtn.addEventListener("click", async () => {
+      const targetDt = targetDtInput.value;
+      if (!targetDt) {
+        alert("Укажите желаемую дату и время");
+        return;
+      }
+      const selectedLpus = Array.from(branchList.querySelectorAll(".branch-checkbox:checked")).map(cb => cb.value);
+      if (selectedLpus.length === 0) {
+        alert("Выберите хотя бы один подходящий филиал для поиска!");
+        return;
+      }
+
+      findNowBtn.disabled = true;
+      findNowBtn.innerText = "🔍 Поиск слотов...";
+      quickSlotsContainer.classList.remove("hidden");
+      slotsList.innerHTML = `<div style="color:#64748b;text-align:center;padding:10px;">Запрос расписания...</div>`;
 
       try {
         const apptId = apptSelect.value;
-        const appt = appointments.find(a => String(a.id) === String(apptId)) || appointments[0];
-        const targetDt = targetDtInput.value;
+        const appt = appointments.find(a => String(a.id) === String(apptId)) || currentAppt;
+        const slots = await fetchAvailableSchedule(appt, targetDt.split("T")[0], {
+          anyDoctor: anyDoctorCb.checked,
+          allowedLpuIds: selectedLpus
+        });
 
-        if (!targetDt) {
-          alert("Укажите желаемую дату и время");
-          return;
-        }
-
-        const slots = await fetchAvailableSchedule(appt, targetDt.split("T")[0]);
         const matched = findBestSlots(slots, targetDt, {
-          windowMinutes: windowSelect.value === "any" ? null : parseInt(windowSelect.value, 10),
+          windowMinutes: timeWindowSelect.value === "any" ? null : parseInt(timeWindowSelect.value, 10),
           onlyTargetDate: true
         });
 
         if (matched.length === 0) {
-          previewContainer.innerHTML = `<div style="text-align:center;color:#64748b;padding:8px;">На эту дату подходящих слотов не найдено (всего слотов: ${slots.length}).</div>`;
+          slotsList.innerHTML = `<div style="color:#64748b;text-align:center;padding:10px;">На эту дату подходящих слотов не найдено (проверено: ${slots.length}). Запустите автоперенос для ожидания отмен.</div>`;
         } else {
-          previewContainer.innerHTML = `
-            <div style="font-weight:600;font-size:11px;margin-bottom:6px;color:#0f172a;">Найдено ${matched.length} слотов:</div>
-            ${matched.slice(0, 5).map((s, idx) => `
-              <div style="display:flex;justify-content:space-between;align-items:center;background:white;padding:6px 8px;border-radius:6px;margin-bottom:4px;font-size:11px;border:1px solid #e2e8f0;">
-                <div>
-                  <b>${s.formattedTime}</b> (${s.formattedDate})
-                  <div style="font-size:10px;color:#64748b;">${s.doctorName || s.cabinet || ""} · Δ ${s.absDiffMinutes} мин</div>
+          slotsList.innerHTML = "";
+          const fragment = document.createDocumentFragment();
+          matched.slice(0, 6).forEach(slot => {
+            const card = document.createElement("div");
+            card.className = "slot-card";
+            card.innerHTML = `
+              <div>
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <span class="slot-time">${slot.formattedTime}</span>
+                  <span class="slot-delta">Δ ${slot.absDiffMinutes} мин</span>
                 </div>
-                <button class="emias-shift-now-btn" data-idx="${idx}" style="background:#00897B;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">
-                  Перенести
-                </button>
+                <div class="slot-meta">${slot.doctorName || slot.cabinet || ""} · ${slot.lpuName}</div>
               </div>
-            `).join("")}
-          `;
+              <button class="slot-shift-btn">Перенести</button>
+            `;
 
-          previewContainer.querySelectorAll(".emias-shift-now-btn").forEach(btn => {
-            btn.addEventListener("click", async (e) => {
-              const idx = parseInt(e.target.getAttribute("data-idx"), 10);
-              const targetSlot = matched[idx];
-              if (confirm(`Перенести запись на ${targetSlot.formattedFull}?`)) {
+            const btn = card.querySelector(".slot-shift-btn");
+            btn.addEventListener("click", async () => {
+              if (confirm(`Подтвердите перенос записи на ${slot.formattedFull}?`)) {
                 btn.disabled = true;
                 btn.innerText = "...";
                 try {
-                  await performShift(appt, targetSlot);
+                  await performShift(appt, slot);
                   playSuccessChime();
                   await refreshAppointmentsAfterShift();
-                  await addLog(`Ручной перенос на ${targetSlot.formattedFull}`, "success");
-                  alert(`✅ Запись успешно перенесена на ${targetSlot.formattedFull}!`);
-                  drawer.style.display = "none";
+                  await addLog(`Ручной перенос на ${slot.formattedFull} (${slot.lpuName})`, "success");
+                  showFloatingToast("✅ Запись успешно перенесена!");
+                  setTimeout(() => { drawer.style.display = "none"; }, 1000);
                 } catch (err) {
-                  alert("Ошибка при переносе: " + err.message);
+                  alert("Ошибка переноса: " + err.message);
+                  btn.disabled = false;
+                  btn.innerText = "Перенести";
                 }
               }
             });
+
+            fragment.appendChild(card);
           });
+          slotsList.appendChild(fragment);
         }
       } catch (err) {
-        previewContainer.innerHTML = `<div style="color:#dc2626;padding:8px;">Ошибка: ${err.message}</div>`;
+        slotsList.innerHTML = `<div style="color:#dc2626;padding:8px;">Ошибка: ${err.message}</div>`;
       } finally {
-        findBtn.disabled = false;
-        findBtn.innerText = "🔍 Проверить сейчас";
+        findNowBtn.disabled = false;
+        findNowBtn.innerText = "🔍 Найти слоты сейчас";
       }
     });
 
-    toggleBtn.addEventListener("click", async () => {
+    // Toggle monitor button
+    toggleMonitorBtn.addEventListener("click", async () => {
       if (isMonitoring) {
         await stopMonitoring();
         await addLog("⏹️ Мониторинг остановлен пользователем", "stop");
+        showFloatingToast("Мониторинг остановлен");
       } else {
         const apptId = apptSelect.value;
         const targetDt = targetDtInput.value;
-
         if (!targetDt) {
           alert("Укажите желаемое время для переноса");
           return;
         }
 
-        const config = {
+        const selectedLpus = Array.from(branchList.querySelectorAll(".branch-checkbox:checked")).map(cb => cb.value);
+        if (selectedLpus.length === 0) {
+          alert("Выберите хотя бы один подходящий филиал для поиска!");
+          return;
+        }
+
+        const checkedRadio = drawer.querySelector("input[name='drawer-transfer-mode']:checked");
+        const chosenMode = checkedRadio ? checkedRadio.value : "semi";
+
+        const cfg = {
           appointmentId: apptId,
           targetDatetime: targetDt,
-          timeWindow: windowSelect.value,
-          anyDoctor: true,
+          timeWindow: timeWindowSelect.value,
+          anyDoctor: anyDoctorCb.checked,
+          transferMode: chosenMode,
+          allowedLpuIds: selectedLpus,
           checkCount: 0
         };
 
         await chrome.storage.local.set({
           monitoringActive: true,
-          monitoringConfig: config,
-          transferMode: modeSelect.value
+          monitoringConfig: cfg,
+          transferMode: chosenMode
         });
 
         setUnloadProtection(true);
         chrome.runtime.sendMessage({ type: "UPDATE_MONITOR_BADGE", active: true });
 
-        // Send start notification to Telegram with control keyboard
         const tgData = await chrome.storage.local.get(["tgToken", "tgChatId"]);
         if (tgData.tgToken && tgData.tgChatId) {
-          const modeLabel = modeSelect.value === "semi" ? "📲 Полуавтомат (подтверждение кнопкой)" : "⚡ Полный автомат";
-          const startMsg = buildTelegramStartMessage(currentAppt, targetDt, modeLabel);
-
+          const appt = appointments.find(a => String(a.id) === String(apptId)) || currentAppt;
+          const modeLabel = chosenMode === "semi" ? "📲 Полуавтомат (подтверждение кнопкой)" : "⚡ Полный автомат";
+          const startMsg = buildTelegramStartMessage(appt, targetDt, modeLabel);
           const keyboard = {
             keyboard: [
               [{ text: "📊 Проверить статус" }],
@@ -1081,16 +2035,93 @@
             resize_keyboard: true,
             persistent: true
           };
-
           await TelegramBot.sendMessage(tgData.tgToken, tgData.tgChatId, startMsg, { replyMarkup: keyboard });
           startTelegramPoller();
         }
 
-        await addLog(`🚀 Запущен мониторинг (${modeSelect.value === "semi" ? "полуавтомат" : "полный автомат"})`, "info");
+        await addLog(`🚀 Запущен мониторинг (${chosenMode === "semi" ? "полуавтомат" : "полный автомат"})`, "info");
+        showFloatingToast("🚀 Автоперенос запущен!");
         renderFloatingUi();
         runMonitoringCycle();
       }
     });
+
+    // Clear logs
+    popupClearLogBtn?.addEventListener("click", async () => {
+      await chrome.storage.local.set({ monitoringLogs: [] });
+      renderMiniLogUi([]);
+      showFloatingToast("Журнал очищен");
+    });
+
+    // Save Telegram
+    saveTgBtn?.addEventListener("click", async () => {
+      const token = tgTokenInput.value.trim();
+      const chatId = tgChatIdInput.value.trim();
+      await chrome.storage.local.set({ tgToken: token, tgChatId: chatId });
+      tgTestStatus.className = "status-msg success";
+      tgTestStatus.textContent = "✅ Настройки сохранены";
+      showFloatingToast("Настройки Telegram сохранены");
+    });
+
+    // Test Telegram
+    testTgBtn?.addEventListener("click", async () => {
+      const token = tgTokenInput.value.trim();
+      const chatId = tgChatIdInput.value.trim();
+      if (!token || !chatId) {
+        tgTestStatus.className = "status-msg error";
+        tgTestStatus.textContent = "⚠️ Заполните токен и Chat ID";
+        return;
+      }
+      testTgBtn.disabled = true;
+      tgTestStatus.className = "status-msg";
+      tgTestStatus.textContent = "⏳ Отправка тестового сообщения...";
+      try {
+        const res = await TelegramBot.sendMessage(token, chatId, "🔔 *Тестовое сообщение* от расширения «ЕМИАС Автоперенос»!\nСвязь настроена успешно.");
+        if (res && res.ok) {
+          tgTestStatus.className = "status-msg success";
+          tgTestStatus.textContent = "✅ Сообщение успешно отправлено в Telegram!";
+        } else {
+          tgTestStatus.className = "status-msg error";
+          tgTestStatus.textContent = "❌ Ошибка: " + ((res && res.error) || "Не удалось отправить");
+        }
+      } catch (e) {
+        tgTestStatus.className = "status-msg error";
+        tgTestStatus.textContent = "❌ Ошибка сети: " + e.message;
+      } finally {
+        testTgBtn.disabled = false;
+      }
+    });
+
+    // Copy API Summary
+    copySummaryBtn?.addEventListener("click", async () => {
+      const data = await chrome.storage.local.get("capturedRequests");
+      const list = data.capturedRequests || [];
+      const summary = {
+        total: list.length,
+        endpoints: list.map(r => ({
+          method: r.method,
+          url: r.url,
+          status: r.status,
+          request: r.requestBody,
+          response: r.responseBody
+        }))
+      };
+      navigator.clipboard.writeText(JSON.stringify(summary, null, 2));
+      showFloatingToast("📋 Сводка API скопирована!");
+    });
+
+    // Clear API requests
+    clearRequestsBtn?.addEventListener("click", async () => {
+      await chrome.storage.local.set({ capturedRequests: [] });
+      loadDrawerRequests();
+      showFloatingToast("Журнал API очищен");
+    });
+
+    // Restore drawer visibility and tab
+    if (wasDrawerOpen) {
+      drawer.style.display = "flex";
+    }
+    switchTab(activeTabId);
   }
 
   // Auto-init
