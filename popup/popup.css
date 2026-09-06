@@ -366,6 +366,107 @@ body {
   user-select: none;
 }
 
+/* Branch Selector */
+.branch-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.branch-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.branch-sep {
+  color: #cbd5e1;
+  font-size: 11px;
+}
+
+.branch-list {
+  background: white;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 6px;
+  max-height: 145px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.branch-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px solid #f1f5f9;
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+
+.branch-item:hover {
+  background: #f0fdfa;
+  border-color: #ccfbf1;
+}
+
+.branch-item input[type="checkbox"] {
+  margin-top: 3px;
+  accent-color: #00897B;
+  cursor: pointer;
+}
+
+.branch-item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+
+.branch-item-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: #0f172a;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.branch-current-tag {
+  font-size: 9px;
+  font-weight: 700;
+  color: #00897B;
+  background: #e6fffa;
+  padding: 1px 5px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.branch-item-address {
+  font-size: 10px;
+  color: #64748b;
+  line-height: 1.25;
+}
+
+.branch-empty, .branch-loading {
+  font-size: 11px;
+  color: #64748b;
+  padding: 10px 8px;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.branch-empty-hint {
+  font-size: 10px;
+  color: #94a3b8;
+  margin-top: 3px;
+}
+
 /* Buttons */
 .button-row {
   display: flex;

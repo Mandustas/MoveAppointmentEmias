@@ -10,6 +10,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   const targetDtInput = document.getElementById("target-datetime");
   const timeWindowSelect = document.getElementById("time-window");
   const anyDoctorCb = document.getElementById("any-doctor");
+  const branchSelectionContainer = document.getElementById("branch-selection-container");
+  const branchList = document.getElementById("branch-list");
+  const branchSelectAllBtn = document.getElementById("branch-select-all-btn");
+  const branchDeselectAllBtn = document.getElementById("branch-deselect-all-btn");
   const findNowBtn = document.getElementById("find-now-btn");
   const toggleMonitorBtn = document.getElementById("toggle-monitor-btn");
 
@@ -172,12 +176,123 @@ document.addEventListener("DOMContentLoaded", async () => {
     apptSelect.value = targetId;
     const selected = cachedAppointments.find(a => String(a.id) === String(apptSelect.value)) || cachedAppointments[0];
     updateRichCard(selected);
+    await renderBranchSelector(selected);
   }
 
-  apptSelect.addEventListener("change", () => {
+  apptSelect.addEventListener("change", async () => {
     const selected = cachedAppointments.find(a => String(a.id) === String(apptSelect.value));
     updateRichCard(selected);
+    await renderBranchSelector(selected);
   });
+
+  // Render Branch/Clinic Selector
+  async function renderBranchSelector(selectedAppt) {
+    if (!branchList) return;
+
+    if (!selectedAppt) {
+      branchList.innerHTML = '<div class="branch-empty">Нет выбранной записи</div>';
+      return;
+    }
+
+    const store = await chrome.storage.local.get(["doctorsInfoMap", "monitoringConfig"]);
+    const doctorsMap = store.doctorsInfoMap || {};
+    const doctorsList = doctorsMap[selectedAppt.id] || doctorsMap[String(selectedAppt.id)] || doctorsMap["last"] || [];
+    const branchesMap = new Map();
+
+    // 1. Current appointment branch
+    if (selectedAppt.lpuId) {
+      const curLpuId = String(selectedAppt.lpuId);
+      branchesMap.set(curLpuId, {
+        lpuId: curLpuId,
+        name: selectedAppt.nameLpu || `Филиал #${curLpuId}`,
+        address: selectedAppt.lpuAddress || selectedAppt.address || "",
+        isCurrent: true
+      });
+    }
+
+    // 2. Discovered branches from doctorsInfoList
+    if (Array.isArray(doctorsList)) {
+      for (const doc of doctorsList) {
+        const lpuId = String(doc.lpuId || (doc.availableResources && doc.availableResources[0] && doc.availableResources[0].lpuId) || "");
+        if (!lpuId) continue;
+        const existing = branchesMap.get(lpuId) || {};
+        branchesMap.set(lpuId, {
+          lpuId,
+          name: doc.lpuShortName || existing.name || `Филиал #${lpuId}`,
+          address: doc.defaultAddress || existing.address || "",
+          isCurrent: existing.isCurrent || (String(selectedAppt.lpuId) === lpuId)
+        });
+      }
+    }
+
+    if (branchesMap.size === 0) {
+      branchList.innerHTML = `
+        <div class="branch-empty">
+          <div>Филиалы не определены</div>
+          <div class="branch-empty-hint">💡 Откройте запись на сайте emias.info для загрузки филиалов</div>
+        </div>
+      `;
+      return;
+    }
+
+    const savedAllowed = store.monitoringConfig?.allowedLpuIds;
+
+    branchList.innerHTML = "";
+    branchesMap.forEach(b => {
+      const isChecked = Array.isArray(savedAllowed)
+        ? savedAllowed.map(String).includes(b.lpuId)
+        : true;
+
+      const item = document.createElement("label");
+      item.className = "branch-item";
+      item.innerHTML = `
+        <input type="checkbox" class="branch-checkbox" value="${b.lpuId}" ${isChecked ? "checked" : ""}>
+        <div class="branch-item-info">
+          <div class="branch-item-name">
+            <span>${b.name}</span>
+            ${b.isCurrent ? '<span class="branch-current-tag">Текущий</span>' : ''}
+          </div>
+          ${b.address ? `<div class="branch-item-address">📍 ${b.address}</div>` : ''}
+        </div>
+      `;
+
+      const cb = item.querySelector(".branch-checkbox");
+      cb.addEventListener("change", async () => {
+        await saveCurrentAllowedLpus();
+      });
+
+      branchList.appendChild(item);
+    });
+  }
+
+  function getSelectedLpuIds() {
+    if (!branchList) return [];
+    return Array.from(branchList.querySelectorAll(".branch-checkbox:checked")).map(cb => cb.value);
+  }
+
+  async function saveCurrentAllowedLpus() {
+    const checked = getSelectedLpuIds();
+    const store = await chrome.storage.local.get("monitoringConfig");
+    const cfg = store.monitoringConfig || {};
+    cfg.allowedLpuIds = checked;
+    await chrome.storage.local.set({ monitoringConfig: cfg });
+  }
+
+  if (branchSelectAllBtn) {
+    branchSelectAllBtn.addEventListener("click", async () => {
+      branchList.querySelectorAll(".branch-checkbox").forEach(cb => { cb.checked = true; });
+      await saveCurrentAllowedLpus();
+      showToast("Выбраны все филиалы");
+    });
+  }
+
+  if (branchDeselectAllBtn) {
+    branchDeselectAllBtn.addEventListener("click", async () => {
+      branchList.querySelectorAll(".branch-checkbox").forEach(cb => { cb.checked = false; });
+      await saveCurrentAllowedLpus();
+      showToast("Все филиалы отключены");
+    });
+  }
 
   // Populate default target datetime
   async function initTargetDateTime() {
@@ -270,12 +385,22 @@ document.addEventListener("DOMContentLoaded", async () => {
     quickSlotsContainer.classList.remove("hidden");
     slotsList.innerHTML = `<div style="color:#64748b;text-align:center;padding:10px;">Запрос расписания...</div>`;
 
+    const selectedLpus = getSelectedLpuIds();
+    if (selectedLpus.length === 0) {
+      alert("Выберите хотя бы один подходящий филиал для поиска!");
+      findNowBtn.disabled = false;
+      findNowBtn.innerText = "🔍 Найти слоты сейчас";
+      quickSlotsContainer.classList.add("hidden");
+      return;
+    }
+
     try {
       const payload = {
         appointmentId: apptSelect.value,
         targetDatetime: targetDtInput.value,
         timeWindow: timeWindowSelect.value,
-        anyDoctor: anyDoctorCb.checked
+        anyDoctor: anyDoctorCb.checked,
+        allowedLpuIds: selectedLpus
       };
 
       const response = await chrome.tabs.sendMessage(tab.id, {
@@ -363,12 +488,19 @@ document.addEventListener("DOMContentLoaded", async () => {
         return;
       }
 
+      const selectedLpus = getSelectedLpuIds();
+      if (selectedLpus.length === 0) {
+        alert("Выберите хотя бы один подходящий филиал для поиска!");
+        return;
+      }
+
       const config = {
         appointmentId: apptSelect.value,
         targetDatetime: targetDtInput.value,
         timeWindow: timeWindowSelect.value,
         anyDoctor: anyDoctorCb.checked,
         transferMode: getSelectedMode(),
+        allowedLpuIds: selectedLpus,
         checkCount: 0
       };
 
@@ -471,6 +603,24 @@ document.addEventListener("DOMContentLoaded", async () => {
     await chrome.storage.local.set({ capturedRequests: [] });
     await loadRequests();
     showToast("Журнал очищен");
+  });
+
+  // Storage changes listener
+  chrome.storage.onChanged.addListener(async (changes, area) => {
+    if (area !== "local") return;
+    if (changes.appointments) {
+      await loadAppointments();
+    }
+    if (changes.doctorsInfoMap) {
+      const selected = cachedAppointments.find(a => String(a.id) === String(apptSelect.value)) || cachedAppointments[0];
+      await renderBranchSelector(selected);
+    }
+    if (changes.monitoringActive || changes.monitoringConfig) {
+      await updateMonitorCard();
+    }
+    if (changes.monitoringLogs) {
+      await loadLogs();
+    }
   });
 
   // Init

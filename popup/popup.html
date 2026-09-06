@@ -114,9 +114,25 @@
         <div class="form-group checkbox-cell">
           <label class="checkbox-label">
             <input type="checkbox" id="any-doctor" checked>
-            <span>Любой врач/филиал</span>
+            <span>Любой врач/кабинет</span>
           </label>
         </div>
+      </div>
+
+      <!-- Branch/Clinic Selection -->
+      <div class="form-group" id="branch-selection-container">
+        <div class="branch-header">
+          <label class="form-label" style="margin-bottom: 0;">🏥 Подходящие филиалы:</label>
+          <div class="branch-actions">
+            <button type="button" id="branch-select-all-btn" class="btn-text">Выбрать все</button>
+            <span class="branch-sep">·</span>
+            <button type="button" id="branch-deselect-all-btn" class="btn-text">Снять все</button>
+          </div>
+        </div>
+        <div id="branch-list" class="branch-list">
+          <div class="branch-loading">Загрузка доступных филиалов...</div>
+        </div>
+        <span class="form-hint">Слоты будут искаться только в отмеченных филиалах</span>
       </div>
 
       <!-- Action Buttons -->

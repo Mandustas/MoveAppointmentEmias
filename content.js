@@ -125,7 +125,11 @@
       const { appointmentId, doctorsInfo } = payload;
       const stored = await chrome.storage.local.get("doctorsInfoMap");
       const map = stored.doctorsInfoMap || {};
-      map[appointmentId] = doctorsInfo;
+      if (appointmentId) {
+        map[appointmentId] = doctorsInfo;
+        map[String(appointmentId)] = doctorsInfo;
+      }
+      map["last"] = doctorsInfo;
       await chrome.storage.local.set({ doctorsInfoMap: map });
     }
 
@@ -144,7 +148,7 @@
   // -------------------------------------------------------------
   // Schedule & Shift API
   // -------------------------------------------------------------
-  async function fetchAvailableSchedule(appointment, targetDateStr) {
+  async function fetchAvailableSchedule(appointment, targetDateStr, configOverride = null) {
     const store = await chrome.storage.local.get(["patientContext", "doctorsInfoMap", "monitoringConfig", "eiToken"]);
     const patientContext = store.patientContext;
     if (!patientContext || !patientContext.omsNumber || !patientContext.birthDate) {
@@ -152,7 +156,7 @@
     }
 
     const doctorsMap = store.doctorsInfoMap || {};
-    const doctorsInfoList = doctorsMap[appointment.id] || [];
+    const doctorsInfoList = doctorsMap[appointment.id] || doctorsMap[String(appointment.id)] || doctorsMap["last"] || [];
 
     // Calculate dates: EMIAS mandates that dateFrom MUST ALWAYS BE today!
     // Querying with dateFrom in the future causes SA_REFERRAL_FOR_FUTURE (HTTP 400).
@@ -176,10 +180,10 @@
     }
     const dateTo = `${toObj.getFullYear()}-${String(toObj.getMonth() + 1).padStart(2, '0')}-${String(toObj.getDate()).padStart(2, '0')}`;
 
-    const resourcesToQuery = [];
+    const allCandidateResources = [];
 
     // 1. Current appointment's resource
-    resourcesToQuery.push({
+    allCandidateResources.push({
       availableResourceId: Number(appointment.availableResourceId),
       complexResourceId: Number(appointment.complexResourceId),
       lpuId: Number(appointment.lpuId),
@@ -188,7 +192,7 @@
     });
 
     // 2. Other resources ONLY if complexResourceId is known
-    const config = store.monitoringConfig || {};
+    const config = configOverride || store.monitoringConfig || {};
     if (config.anyDoctor && Array.isArray(doctorsInfoList) && doctorsInfoList.length > 0) {
       for (const doc of doctorsInfoList) {
         if (Array.isArray(doc.availableResources)) {
@@ -198,7 +202,7 @@
               const crList = res.complexResource;
               const compId = (Array.isArray(crList) && crList[0] && crList[0].id) ? Number(crList[0].id) : null;
               if (compId) {
-                resourcesToQuery.push({
+                allCandidateResources.push({
                   availableResourceId: resId,
                   complexResourceId: compId,
                   lpuId: Number(doc.lpuId || res.lpuId),
@@ -211,6 +215,16 @@
         }
       }
     }
+
+    // Filter candidate resources by allowedLpuIds if configured
+    const allowedLpus = Array.isArray(config.allowedLpuIds) && config.allowedLpuIds.length > 0
+      ? config.allowedLpuIds.map(String)
+      : null;
+
+    const resourcesToQuery = allCandidateResources.filter(r => {
+      if (!allowedLpus) return true;
+      return allowedLpus.includes(String(r.lpuId));
+    });
 
     let allSlots = [];
 
@@ -281,7 +295,7 @@
     while (isTgPollingActive) {
       try {
         const store = await chrome.storage.local.get(["monitoringActive", "tgToken", "tgChatId", "monitoringConfig", "appointments"]);
-        if (!store.monitoringActive || !store.tgToken) {
+        if (!store.tgToken) {
           isTgPollingActive = false;
           break;
         }
@@ -324,13 +338,18 @@
   }
 
   async function handleTelegramCommand(cmdText, store) {
-    const { tgToken, tgChatId, monitoringConfig, appointments } = store;
+    const { tgToken, tgChatId, monitoringConfig, appointments, monitoringActive } = store;
 
     if (cmdText === "/stop" || cmdText.includes("Прекратить") || cmdText.includes("Остановить")) {
       await stopMonitoring();
       await addLog("⏹️ Мониторинг остановлен по команде из Telegram", "stop");
       await TelegramBot.sendMessage(tgToken, tgChatId, "⏹️ *Мониторинг ЕМИАС остановлен.*\nЗапросы к порталу прекращены по вашей команде.", {
-        replyMarkup: { remove_keyboard: true }
+        replyMarkup: {
+          keyboard: [
+            [{ text: "📊 Проверить статус" }]
+          ],
+          resize_keyboard: true
+        }
       });
     } else if (cmdText === "/status" || cmdText.includes("Статус") || cmdText.includes("статус")) {
       const appt = appointments?.find(a => String(a.id) === String(monitoringConfig?.appointmentId)) || appointments?.[0];
@@ -338,13 +357,25 @@
       const target = monitoringConfig?.targetDatetime ? new Date(monitoringConfig.targetDatetime).toLocaleString("ru-RU") : "не указана";
 
       const statusMsg = `📊 *Текущий статус мониторинга:*\n\n` +
-        `🟢 *Состояние:* Активен\n` +
+        `🔘 *Состояние:* ${monitoringActive ? "🟢 Активен (поиск слотов)" : "⏹️ Остановлен"}\n` +
         `📋 *Запись:* ${apptName} (${appt?.number || ""})\n` +
-        `🎯 *Целевое время:* ${target}\n` +
+        `📅 *Текущий приём:* ${appt?.startTime ? new Date(appt.startTime).toLocaleString("ru-RU") : ""}\n` +
+        `🏥 *Филиал:* ${appt?.nameLpu || ""}\n` +
+        `🎯 *Цель переноса:* ${target}\n` +
         `🔄 *Проверок выполнено:* ${monitoringConfig?.checkCount || 0}\n` +
         `⏳ *Последняя проверка:* ${monitoringConfig?.lastCheckTime || "только что"}`;
 
-      await TelegramBot.sendMessage(tgToken, tgChatId, statusMsg);
+      await TelegramBot.sendMessage(tgToken, tgChatId, statusMsg, {
+        replyMarkup: {
+          keyboard: monitoringActive ? [
+            [{ text: "📊 Проверить статус" }],
+            [{ text: "⏹️ Прекратить поиск" }]
+          ] : [
+            [{ text: "📊 Проверить статус" }]
+          ],
+          resize_keyboard: true
+        }
+      });
     }
   }
 
@@ -361,16 +392,41 @@
         return;
       }
 
-      await TelegramBot.editMessageText(tgToken, tgChatId, msgId, `⏳ Бронируем слот: *${pendingSlotToShift.formattedFull}*...`);
+      // Keep targetSlot safe before stopMonitoring() clears pendingSlotToShift!
+      const targetSlot = { ...pendingSlotToShift };
+
+      await TelegramBot.editMessageText(tgToken, tgChatId, msgId, `⏳ Бронируем слот: *${targetSlot.formattedFull}* (${targetSlot.lpuName})...`);
 
       const appt = appointments?.find(a => String(a.id) === String(monitoringConfig?.appointmentId)) || appointments?.[0];
       try {
-        await performShift(appt, pendingSlotToShift);
+        await performShift(appt, targetSlot);
         playSuccessChime();
         await stopMonitoring();
 
-        await addLog(`🎉 Успешно перенесено на ${pendingSlotToShift.formattedFull}!`, "success");
-        await TelegramBot.editMessageText(tgToken, tgChatId, msgId, `🎉 *Запись успешно перенесена!*\n\n🕒 Новое время: *${pendingSlotToShift.formattedFull}*\n🩺 Врач/Кабинет: ${pendingSlotToShift.doctorName || pendingSlotToShift.cabinet}\n🏥 Место: ${pendingSlotToShift.lpuName}`);
+        // Refresh active appointments from EMIAS server so popup and page show the new appointment!
+        try {
+          const patientStore = await chrome.storage.local.get("patientContext");
+          const pCtx = patientStore.patientContext;
+          if (pCtx) {
+            const refreshed = await executeBridgeCmd("CMD_REFRESH_APPOINTMENTS", {
+              omsNumber: String(pCtx.omsNumber),
+              birthDate: String(pCtx.birthDate),
+              patientId: pCtx.patientId ? String(pCtx.patientId) : null
+            });
+            if (refreshed && refreshed.payload && refreshed.payload.appointment) {
+              await chrome.storage.local.set({
+                appointments: refreshed.payload.appointment,
+                lastAppointmentsSync: Date.now()
+              });
+              renderFloatingUi();
+            }
+          }
+        } catch (e) {
+          console.warn("[EMIAS] Не удалось синхронизировать записи после переноса:", e);
+        }
+
+        await addLog(`🎉 Успешно перенесено на ${targetSlot.formattedFull} (${targetSlot.lpuName})!`, "success");
+        await TelegramBot.editMessageText(tgToken, tgChatId, msgId, `🎉 *Запись успешно перенесена!*\n\n🕒 Новое время: *${targetSlot.formattedFull}*\n🩺 Врач/Кабинет: ${targetSlot.doctorName || targetSlot.cabinet}\n🏥 Место: ${targetSlot.lpuName}`);
         pendingSlotToShift = null;
       } catch (err) {
         await addLog(`⚠️ Ошибка бронирования: ${err.message}`, "error");
@@ -440,17 +496,20 @@
           await addLog(`🎯 Найден слот ${bestSlot.formattedFull} (Δ ${bestSlot.absDiffMinutes} мин). Запрос подтверждения отправлен в Telegram`, "match");
           updateStatusUi(`🎯 Найден слот ${bestSlot.formattedTime}! Ожидание подтверждения в Telegram...`);
 
+          const shortBranch = bestSlot.lpuName ? (bestSlot.lpuName.replace(/ГБУЗ|ДЗМ/gi, '').trim().split(" ").slice(-2).join(" ")) : "";
+          const btnLabel = shortBranch ? `✅ Перенести на ${bestSlot.formattedTime} (${shortBranch})` : `✅ Перенести на ${bestSlot.formattedTime}`;
+
           const promptText = `🔔 *Найден подходящий талон в ЕМИАС!*\n\n` +
-            `📋 *Запись:* [${appointment.number || ""}] ${appointment.toBM ? appointment.toBM.name : (appointment.specialityName || "Приём")}\n` +
-            `🩺 *Врач/Кабинет:* ${bestSlot.doctorName || bestSlot.cabinet || "Врач"}\n` +
-            `🏥 *Место:* ${bestSlot.lpuName}\n` +
+            `📋 *Процедура:* ${appointment.toBM ? appointment.toBM.name : (appointment.specialityName || "Приём")} (${appointment.number || ""})\n` +
+            `🏥 *Филиал / Адрес:* *${bestSlot.lpuName}*\n` +
+            `🩺 *Кабинет/Врач:* ${bestSlot.doctorName || bestSlot.cabinet || "Кабинет"}\n` +
             `🕒 *Новое время:* *${bestSlot.formattedFull}*\n` +
-            `*(отклонение: ${bestSlot.absDiffMinutes} мин от желаемого)*\n\n` +
-            `Нажмите кнопку ниже для подтверждения:`;
+            `⏱️ *Отклонение:* ${bestSlot.absDiffMinutes} мин. от цели\n\n` +
+            `Подтвердите перенос нажатием кнопки на телефоне:`;
 
           const keyboard = {
             inline_keyboard: [
-              [{ text: `✅ Перенести на ${bestSlot.formattedTime}`, callback_data: "shift_confirm" }],
+              [{ text: btnLabel, callback_data: "shift_confirm" }],
               [{ text: "❌ Пропустить этот слот", callback_data: "shift_skip" }],
               [{ text: "⏹️ Прекратить поиск", callback_data: "shift_stop" }]
             ]
@@ -495,6 +554,9 @@
     scheduleNextCycle(jitterSeconds);
   }
 
+  // -------------------------------------------------------------
+  // Monitoring Scheduler & Stop Controls
+  // -------------------------------------------------------------
   function scheduleNextCycle(delaySeconds) {
     if (monitoringTimer) clearTimeout(monitoringTimer);
     if (countdownTimer) clearInterval(countdownTimer);
@@ -948,8 +1010,8 @@
     if (message.type === "POPUP_SEARCH_SLOTS") {
       (async () => {
         try {
-          const { appointmentId, targetDatetime, timeWindow, anyDoctor } = message.payload;
-          const store = await chrome.storage.local.get("appointments");
+          const { appointmentId, targetDatetime, timeWindow, anyDoctor, allowedLpuIds } = message.payload;
+          const store = await chrome.storage.local.get(["appointments", "monitoringConfig"]);
           const appointments = store.appointments || [];
           const appt = appointments.find(a => String(a.id) === String(appointmentId)) || appointments[0];
           if (!appt) {
@@ -957,8 +1019,17 @@
             return;
           }
 
+          // Persist the user's branch selection
+          const currentConfig = store.monitoringConfig || {};
+          currentConfig.appointmentId = appointmentId;
+          currentConfig.targetDatetime = targetDatetime;
+          currentConfig.timeWindow = timeWindow;
+          currentConfig.anyDoctor = anyDoctor;
+          if (allowedLpuIds) currentConfig.allowedLpuIds = allowedLpuIds;
+          await chrome.storage.local.set({ monitoringConfig: currentConfig });
+
           const targetDateStr = targetDatetime.split("T")[0];
-          const slots = await fetchAvailableSchedule(appt, targetDateStr);
+          const slots = await fetchAvailableSchedule(appt, targetDateStr, { anyDoctor, allowedLpuIds });
           const matched = findBestSlots(slots, targetDatetime, {
             windowMinutes: timeWindow === "any" ? null : parseInt(timeWindow, 10),
             onlyTargetDate: true
@@ -982,7 +1053,30 @@
 
           await performShift(appt, targetSlot);
           playSuccessChime();
-          await addLog(`Ручной перенос на ${targetSlot.formattedFull}`, "success");
+          await addLog(`Ручной перенос на ${targetSlot.formattedFull} (${targetSlot.lpuName})`, "success");
+
+          // Refresh appointments from server so popup & in-page UI immediately reflect the change
+          try {
+            const patientStore = await chrome.storage.local.get("patientContext");
+            const pCtx = patientStore.patientContext;
+            if (pCtx) {
+              const refreshed = await executeBridgeCmd("CMD_REFRESH_APPOINTMENTS", {
+                omsNumber: String(pCtx.omsNumber),
+                birthDate: String(pCtx.birthDate),
+                patientId: pCtx.patientId ? String(pCtx.patientId) : null
+              });
+              if (refreshed && refreshed.payload && refreshed.payload.appointment) {
+                await chrome.storage.local.set({
+                  appointments: refreshed.payload.appointment,
+                  lastAppointmentsSync: Date.now()
+                });
+                renderFloatingUi();
+              }
+            }
+          } catch (e) {
+            console.warn("[EMIAS] Не удалось синхронизировать записи после ручного переноса:", e);
+          }
+
           sendResponse({ success: true });
         } catch (err) {
           sendResponse({ success: false, error: err.message });
