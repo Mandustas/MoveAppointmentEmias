@@ -3,12 +3,53 @@
   if (window.__EMIAS_INTERCEPTOR_INITIALIZED__) return;
   window.__EMIAS_INTERCEPTOR_INITIALIZED__ = true;
   window.__EMIAS_CAPTURED_API__ = window.__EMIAS_CAPTURED_API__ || [];
+  window.__EMIAS_PATIENT__ = window.__EMIAS_PATIENT__ || null;
 
   console.log("%c[EMIAS Assistant]%c Сетевой мост и сниффер активированы", "background:#00897B;color:white;padding:2px 6px;border-radius:3px;font-weight:bold;", "color:#00897B;font-weight:bold;");
 
   const originalFetch = window.fetch;
   const origOpen = XMLHttpRequest.prototype.open;
   const origSend = XMLHttpRequest.prototype.send;
+
+  // Scan localStorage and sessionStorage for patient context as instant fallback
+  function scanStorageForPatient() {
+    try {
+      const storages = [window.localStorage, window.sessionStorage];
+      for (const storage of storages) {
+        if (!storage) continue;
+        for (let i = 0; i < storage.length; i++) {
+          const key = storage.key(i);
+          const val = storage.getItem(key);
+          if (!val || typeof val !== "string") continue;
+
+          // Match birthDate or birthday or similar
+          const bMatch = val.match(/"(?:birthDate|birthday|birth_date|dateOfBirth)"\s*:\s*"([^"]+)"/i);
+          // Match omsNumber or oms
+          const oMatch = val.match(/"(?:omsNumber|oms|policyNumber)"\s*:\s*"([^"]+)"/i);
+
+          if (bMatch && oMatch && !bMatch[1].includes("REDACTED")) {
+            window.__EMIAS_PATIENT__ = {
+              birthDate: bMatch[1],
+              omsNumber: oMatch[1]
+            };
+            window.postMessage({
+              source: "EMIAS_INTERCEPTOR",
+              type: "PATIENT_CONTEXT_SYNC",
+              payload: window.__EMIAS_PATIENT__
+            }, "*");
+            console.log("%c[EMIAS Assistant]%c Пациент синхронизирован из хранилища браузера:", "background:#00897B;color:white;padding:2px 4px;font-weight:bold;", "color:#00897B;", window.__EMIAS_PATIENT__.omsNumber);
+            return window.__EMIAS_PATIENT__;
+          }
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+  scanStorageForPatient();
+  // Also scan on DOM ready
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", scanStorageForPatient);
+  }
 
   function sanitizeData(data, depth = 0) {
     if (depth > 6) return "...";
@@ -58,24 +99,27 @@
     );
   }
 
-  // Handle specialized responses to sync patient & appointments
   function handleSpecializedApi(url, reqBody, resData) {
-    if (!resData || !resData.payload) return;
-
-    // Whenever ANY /api-eip/ call has omsNumber and birthDate, capture patientContext!
+    // Whenever ANY /api-eip/ call has omsNumber and birthDate, save the REAL patientContext!
     if (reqBody && reqBody.omsNumber && reqBody.birthDate) {
-      window.postMessage({
-        source: "EMIAS_INTERCEPTOR",
-        type: "PATIENT_CONTEXT_SYNC",
-        payload: {
-          omsNumber: String(reqBody.omsNumber),
-          birthDate: String(reqBody.birthDate),
+      const bDate = String(reqBody.birthDate);
+      const oms = String(reqBody.omsNumber);
+      if (!bDate.includes("REDACTED")) {
+        window.__EMIAS_PATIENT__ = {
+          omsNumber: oms,
+          birthDate: bDate,
           patientId: reqBody.patientId ? String(reqBody.patientId) : null
-        }
-      }, "*");
+        };
+        window.postMessage({
+          source: "EMIAS_INTERCEPTOR",
+          type: "PATIENT_CONTEXT_SYNC",
+          payload: window.__EMIAS_PATIENT__
+        }, "*");
+      }
     }
 
-    // 1. Captured Active Appointments
+    if (!resData || !resData.payload) return;
+
     if (url.includes("getAppointmentReceptionsByPatient")) {
       const appointments = resData.payload.appointment || [];
       window.postMessage({
@@ -85,16 +129,21 @@
       }, "*");
     }
 
-    // 2. Captured Doctors / Resources Info for appointment
     if (url.includes("getDoctorsInfoForLI") || url.includes("getDoctorsInfo")) {
       const doctorsInfo = resData.payload.doctorsInfo || [];
       const appointmentId = reqBody?.appointmentId || null;
-
       window.postMessage({
         source: "EMIAS_INTERCEPTOR",
         type: "DOCTORS_INFO_SYNC",
         payload: { appointmentId, doctorsInfo }
       }, "*");
+    }
+
+    if (url.includes("getAvailableResourceScheduleInfo")) {
+      console.log("%c[EMIAS Assistant] Зафиксирован реальный вызов расписания ЕМИАС:%c", "color:#0284c7;font-weight:bold;", "", {
+        request: reqBody,
+        response: resData
+      });
     }
   }
 
@@ -152,12 +201,8 @@
           };
 
           broadcastCaptured(apiRecord);
-        }).catch(err => {
-          console.warn("[EMIAS Interceptor] Failed to read response clone:", err);
-        });
-      } catch (err) {
-        console.warn("[EMIAS Interceptor] Clone error:", err);
-      }
+        }).catch(err => {});
+      } catch (err) {}
     }
 
     return response;
@@ -210,7 +255,7 @@
   };
 
   // -------------------------------------------------------------
-  // Command execution bridge: allows content.js to call EMIAS API
+  // Command execution bridge
   // -------------------------------------------------------------
   window.addEventListener("message", async (event) => {
     if (event.source !== window || !event.data || event.data.source !== "EMIAS_EXTENSION_CONTENT") {
@@ -221,6 +266,17 @@
 
     try {
       if (action === "CMD_GET_SCHEDULE") {
+        if (!window.__EMIAS_PATIENT__) {
+          scanStorageForPatient();
+        }
+        // Fallback for birthDate / omsNumber if missing or redacted in payload
+        if ((!payload.birthDate || payload.birthDate === "undefined" || payload.birthDate.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
+          payload.birthDate = window.__EMIAS_PATIENT__.birthDate;
+        }
+        if ((!payload.omsNumber || payload.omsNumber === "undefined" || payload.omsNumber.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
+          payload.omsNumber = window.__EMIAS_PATIENT__.omsNumber;
+        }
+
         const res = await originalFetch("/api-eip/v4/saOrchestrator/getAvailableResourceScheduleInfo", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -235,11 +291,10 @@
         }
 
         if (!res.ok) {
-          console.error("%c[EMIAS 400 ERROR]%c", "background:#dc2626;color:white;font-weight:bold;padding:2px 6px;border-radius:3px;", "color:#dc2626;font-weight:bold;", {
-            status: res.status,
-            errorData: data,
-            sentPayload: payload
-          });
+          const errStr = typeof data === "object" ? JSON.stringify(data) : String(data);
+          const payloadStr = JSON.stringify(payload);
+          console.error("%c[EMIAS 400 REASON]:%c " + errStr, "background:#dc2626;color:white;font-weight:bold;padding:2px 4px;", "color:#dc2626;font-weight:bold;");
+          console.error("%c[EMIAS SENT PAYLOAD]:%c " + payloadStr, "background:#475569;color:white;padding:2px 4px;", "color:#334155;");
         }
 
         window.postMessage({
@@ -248,38 +303,55 @@
           reqId,
           status: res.status,
           data: res.ok ? data : null,
-          error: res.ok ? null : (data?.message || data?.error?.message || `Ошибка сервера ${res.status}`)
-        }, "*");
-      } else if (action === "CMD_GET_DOCTORS_FOR_LI") {
-        const res = await originalFetch("/api-eip/v4/saOrchestrator/getDoctorsInfoForLI", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        window.postMessage({
-          source: "EMIAS_INTERCEPTOR",
-          action: "RES_GET_DOCTORS_FOR_LI",
-          reqId,
-          status: res.status,
-          data
+          error: res.ok ? null : (typeof data === "object" ? JSON.stringify(data) : (data || `Ошибка ${res.status}`))
         }, "*");
       } else if (action === "CMD_SHIFT_APPOINTMENT") {
         console.log("%c[EMIAS Assistant]%c Выполняется перенос записи...", "background:#16a34a;color:white;padding:2px 6px;font-weight:bold;", "color:#16a34a;font-weight:bold;", payload);
+        if (!window.__EMIAS_PATIENT__) {
+          scanStorageForPatient();
+        }
+        if ((!payload.birthDate || payload.birthDate === "undefined" || payload.birthDate.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
+          payload.birthDate = window.__EMIAS_PATIENT__.birthDate;
+        }
+        if ((!payload.omsNumber || payload.omsNumber === "undefined" || payload.omsNumber.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
+          payload.omsNumber = window.__EMIAS_PATIENT__.omsNumber;
+        }
+
         const res = await originalFetch("/api-eip/v4/saOrchestrator/shiftAppointment", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
         });
-        const data = await res.json();
+        let data = null;
+        try {
+          data = await res.json();
+        } catch (e) {
+          data = await res.text();
+        }
+
+        if (!res.ok) {
+          console.error("%c[EMIAS SHIFT FAILED]:%c", "background:#dc2626;color:white;font-weight:bold;padding:2px 4px;", "color:#dc2626;font-weight:bold;", data, payload);
+        }
+
         window.postMessage({
           source: "EMIAS_INTERCEPTOR",
           action: "RES_SHIFT_APPOINTMENT",
           reqId,
           status: res.status,
-          data
+          data: res.ok ? data : null,
+          error: res.ok ? null : (typeof data === "object" ? JSON.stringify(data) : (data || `Ошибка ${res.status}`))
         }, "*");
       } else if (action === "CMD_REFRESH_APPOINTMENTS") {
+        if (!window.__EMIAS_PATIENT__) {
+          scanStorageForPatient();
+        }
+        if ((!payload.birthDate || payload.birthDate === "undefined" || payload.birthDate.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
+          payload.birthDate = window.__EMIAS_PATIENT__.birthDate;
+        }
+        if ((!payload.omsNumber || payload.omsNumber === "undefined" || payload.omsNumber.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
+          payload.omsNumber = window.__EMIAS_PATIENT__.omsNumber;
+        }
+
         const res = await originalFetch("/api-eip/v10/saOrchestrator/getAppointmentReceptionsByPatient", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
