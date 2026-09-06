@@ -106,6 +106,11 @@
       await chrome.storage.local.set({ patientContext: merged });
     }
 
+    // EI-Token Sync
+    if (type === "EI_TOKEN_SYNC" && payload && payload.eiToken) {
+      await chrome.storage.local.set({ eiToken: payload.eiToken });
+    }
+
     // Appointments Sync
     if (type === "APPOINTMENTS_SYNC" && payload) {
       await chrome.storage.local.set({
@@ -140,7 +145,7 @@
   // Schedule & Shift API
   // -------------------------------------------------------------
   async function fetchAvailableSchedule(appointment, targetDateStr) {
-    const store = await chrome.storage.local.get(["patientContext", "doctorsInfoMap", "monitoringConfig"]);
+    const store = await chrome.storage.local.get(["patientContext", "doctorsInfoMap", "monitoringConfig", "eiToken"]);
     const patientContext = store.patientContext;
     if (!patientContext || !patientContext.omsNumber || !patientContext.birthDate) {
       throw new Error("Сессия не синхронизирована. Обновите страницу ЕМИАС (F5)");
@@ -208,6 +213,7 @@
           complexResourceId: Number(resInfo.complexResourceId),
           omsNumber: String(patientContext.omsNumber),
           birthDate: String(patientContext.birthDate),
+          eiToken: store.eiToken || null,
           period: {
             dateFrom: dateFrom,
             dateTo: dateTo
@@ -228,7 +234,7 @@
   }
 
   async function performShift(appointment, targetSlot) {
-    const store = await chrome.storage.local.get("patientContext");
+    const store = await chrome.storage.local.get(["patientContext", "eiToken"]);
     const patientContext = store.patientContext;
     if (!patientContext || !patientContext.omsNumber || !patientContext.birthDate) {
       throw new Error("Нет данных сессии пациента");
@@ -241,7 +247,8 @@
       startTime: targetSlot.startTime,
       endTime: targetSlot.endTime,
       omsNumber: String(patientContext.omsNumber),
-      birthDate: String(patientContext.birthDate)
+      birthDate: String(patientContext.birthDate),
+      eiToken: store.eiToken || null
     };
 
     console.log("[EMIAS Assistant] Отправка запроса на сдвиг записи:", payload);

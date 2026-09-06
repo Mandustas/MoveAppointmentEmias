@@ -4,12 +4,15 @@
   window.__EMIAS_INTERCEPTOR_INITIALIZED__ = true;
   window.__EMIAS_CAPTURED_API__ = window.__EMIAS_CAPTURED_API__ || [];
   window.__EMIAS_PATIENT__ = window.__EMIAS_PATIENT__ || null;
+  window.__EMIAS_EI_TOKEN__ = window.__EMIAS_EI_TOKEN__ || null;
+  window.__EMIAS_DEFAULT_HEADERS__ = window.__EMIAS_DEFAULT_HEADERS__ || {};
 
   console.log("%c[EMIAS Assistant]%c Сетевой мост и сниффер активированы", "background:#00897B;color:white;padding:2px 6px;border-radius:3px;font-weight:bold;", "color:#00897B;font-weight:bold;");
 
   const originalFetch = window.fetch;
   const origOpen = XMLHttpRequest.prototype.open;
   const origSend = XMLHttpRequest.prototype.send;
+  const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
   // Scan localStorage and sessionStorage for patient context as instant fallback
   function scanStorageForPatient() {
@@ -46,9 +49,166 @@
     return null;
   }
   scanStorageForPatient();
+
+  // Find EI-Token across multiple sources (Memory, Next.js data, Cookies, Web Storage)
+  function findEiToken() {
+    if (window.__EMIAS_EI_TOKEN__) return window.__EMIAS_EI_TOKEN__;
+
+    // 1. Check window.__NEXT_DATA__
+    try {
+      if (window.__NEXT_DATA__) {
+        const str = JSON.stringify(window.__NEXT_DATA__);
+        const m = str.match(/"(?:ei-token|ei_token|eitoken|eiToken|token)"\s*:\s*"([^"]+)"/i);
+        if (m && m[1] && m[1].length > 10 && !m[1].includes("REDACTED")) {
+          window.__EMIAS_EI_TOKEN__ = m[1];
+          console.log("%c[EMIAS Assistant]%c EI-Token найден в __NEXT_DATA__", "background:#00897B;color:white;padding:2px 4px;font-weight:bold;", "color:#00897B;");
+          window.postMessage({ source: "EMIAS_INTERCEPTOR", type: "EI_TOKEN_SYNC", payload: { eiToken: m[1] } }, "*");
+          return window.__EMIAS_EI_TOKEN__;
+        }
+      }
+    } catch (e) {}
+
+    // 2. Check document.cookie
+    try {
+      const cookies = (document.cookie || "").split(";");
+      for (const cookie of cookies) {
+        const parts = cookie.trim().split("=");
+        const name = parts[0].trim();
+        const val = parts.slice(1).join("=").trim();
+        if (/^(ei-?token|ei_token|eitoken|auth_token|token)$/i.test(name)) {
+          if (val && val.length > 5) {
+            window.__EMIAS_EI_TOKEN__ = decodeURIComponent(val);
+            console.log("%c[EMIAS Assistant]%c EI-Token найден в Cookie (" + name + ")", "background:#00897B;color:white;padding:2px 4px;font-weight:bold;", "color:#00897B;");
+            window.postMessage({ source: "EMIAS_INTERCEPTOR", type: "EI_TOKEN_SYNC", payload: { eiToken: window.__EMIAS_EI_TOKEN__ } }, "*");
+            return window.__EMIAS_EI_TOKEN__;
+          }
+        }
+      }
+    } catch (e) {}
+
+    // 3. Check localStorage & sessionStorage
+    try {
+      const storages = [window.localStorage, window.sessionStorage];
+      for (const storage of storages) {
+        if (!storage) continue;
+        for (let i = 0; i < storage.length; i++) {
+          const key = storage.key(i);
+          if (!key) continue;
+
+          if (/^(ei-?token|ei_token|eitoken|auth_token|token)$/i.test(key)) {
+            let val = storage.getItem(key);
+            if (val) {
+              try {
+                const parsed = JSON.parse(val);
+                if (typeof parsed === "string") val = parsed;
+                else if (parsed && (parsed.token || parsed.value || parsed.eiToken)) {
+                  val = parsed.token || parsed.value || parsed.eiToken;
+                }
+              } catch (e) {}
+              val = String(val).replace(/^["']|["']$/g, '').trim();
+              if (val.length > 5 && !val.includes("REDACTED")) {
+                window.__EMIAS_EI_TOKEN__ = val;
+                console.log("%c[EMIAS Assistant]%c EI-Token найден в хранилище (" + key + ")", "background:#00897B;color:white;padding:2px 4px;font-weight:bold;", "color:#00897B;");
+                window.postMessage({ source: "EMIAS_INTERCEPTOR", type: "EI_TOKEN_SYNC", payload: { eiToken: val } }, "*");
+                return window.__EMIAS_EI_TOKEN__;
+              }
+            }
+          }
+
+          const rawVal = storage.getItem(key);
+          if (rawVal && typeof rawVal === "string") {
+            const m = rawVal.match(/"(?:ei-token|ei_token|eitoken|eiToken|token)"\s*:\s*"([^"]+)"/i);
+            if (m && m[1] && m[1].length > 10 && !m[1].includes("REDACTED")) {
+              window.__EMIAS_EI_TOKEN__ = m[1];
+              console.log("%c[EMIAS Assistant]%c EI-Token извлечён из объекта хранилища (" + key + ")", "background:#00897B;color:white;padding:2px 4px;font-weight:bold;", "color:#00897B;");
+              window.postMessage({ source: "EMIAS_INTERCEPTOR", type: "EI_TOKEN_SYNC", payload: { eiToken: m[1] } }, "*");
+              return window.__EMIAS_EI_TOKEN__;
+            }
+          }
+        }
+      }
+    } catch (e) {}
+
+    return null;
+  }
+  findEiToken();
+
+  function extractHeaderValue(headers, targetName) {
+    if (!headers) return null;
+    const lower = targetName.toLowerCase();
+
+    if (typeof headers.get === "function") {
+      return headers.get(targetName) || headers.get(lower);
+    }
+    if (typeof headers.forEach === "function") {
+      let found = null;
+      headers.forEach((val, key) => {
+        if (key && key.toLowerCase() === lower) found = val;
+      });
+      if (found) return found;
+    }
+    if (typeof headers === "object") {
+      for (const [k, v] of Object.entries(headers)) {
+        if (k && k.toLowerCase() === lower) return v;
+      }
+    }
+    return null;
+  }
+
+  function captureHeaders(headers) {
+    if (!headers) return;
+    try {
+      const token = extractHeaderValue(headers, "EI-Token");
+      if (token && typeof token === "string" && token.length > 5 && !token.includes("REDACTED")) {
+        if (window.__EMIAS_EI_TOKEN__ !== token) {
+          window.__EMIAS_EI_TOKEN__ = token;
+          console.log("%c[EMIAS Assistant]%c Захвачен актуальный EI-Token из сетевого заголовка", "background:#00897B;color:white;padding:2px 4px;font-weight:bold;", "color:#00897B;");
+          window.postMessage({
+            source: "EMIAS_INTERCEPTOR",
+            type: "EI_TOKEN_SYNC",
+            payload: { eiToken: token }
+          }, "*");
+        }
+      }
+
+      if (typeof headers.forEach === "function") {
+        headers.forEach((v, k) => {
+          const kl = String(k).toLowerCase();
+          if (!["host", "content-length", "content-type"].includes(kl)) {
+            window.__EMIAS_DEFAULT_HEADERS__[k] = v;
+          }
+        });
+      } else if (typeof headers === "object") {
+        for (const [k, v] of Object.entries(headers)) {
+          const kl = String(k).toLowerCase();
+          if (!["host", "content-length", "content-type"].includes(kl)) {
+            window.__EMIAS_DEFAULT_HEADERS__[k] = v;
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  function buildRequestHeaders(customHeaders = {}) {
+    const token = window.__EMIAS_EI_TOKEN__ || findEiToken();
+    const headers = {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      ...(window.__EMIAS_DEFAULT_HEADERS__ || {}),
+      ...customHeaders
+    };
+    if (token) {
+      headers["EI-Token"] = token;
+    }
+    return headers;
+  }
+
   // Also scan on DOM ready
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", scanStorageForPatient);
+    document.addEventListener("DOMContentLoaded", () => {
+      scanStorageForPatient();
+      findEiToken();
+    });
   }
 
   function sanitizeData(data, depth = 0) {
@@ -167,6 +327,9 @@
     const url = typeof resource === "string" ? resource : (resource ? resource.url : "");
     const method = (init.method || (resource && resource.method) || "GET").toUpperCase();
 
+    if (init.headers) captureHeaders(init.headers);
+    if (resource && resource.headers) captureHeaders(resource.headers);
+
     let requestBody = null;
     if (init.body) {
       try {
@@ -213,6 +376,29 @@
     this._interceptedUrl = url;
     this._interceptedMethod = method ? method.toUpperCase() : "GET";
     return origOpen.call(this, method, url, ...rest);
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
+    try {
+      if (header) {
+        const lower = header.toLowerCase();
+        if (lower === "ei-token" && value && !value.includes("REDACTED")) {
+          if (window.__EMIAS_EI_TOKEN__ !== value) {
+            window.__EMIAS_EI_TOKEN__ = value;
+            console.log("%c[EMIAS Assistant]%c Захвачен EI-Token из XHR", "background:#00897B;color:white;padding:2px 4px;font-weight:bold;", "color:#00897B;");
+            window.postMessage({
+              source: "EMIAS_INTERCEPTOR",
+              type: "EI_TOKEN_SYNC",
+              payload: { eiToken: value }
+            }, "*");
+          }
+        }
+        if (!["host", "content-length", "content-type"].includes(lower)) {
+          window.__EMIAS_DEFAULT_HEADERS__[header] = value;
+        }
+      }
+    } catch (e) {}
+    return origSetRequestHeader.apply(this, arguments);
   };
 
   XMLHttpRequest.prototype.send = function(body) {
@@ -269,6 +455,9 @@
         if (!window.__EMIAS_PATIENT__) {
           scanStorageForPatient();
         }
+        if (payload.eiToken && !window.__EMIAS_EI_TOKEN__) {
+          window.__EMIAS_EI_TOKEN__ = payload.eiToken;
+        }
         // Fallback for birthDate / omsNumber if missing or redacted in payload
         if ((!payload.birthDate || payload.birthDate === "undefined" || payload.birthDate.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
           payload.birthDate = window.__EMIAS_PATIENT__.birthDate;
@@ -277,10 +466,19 @@
           payload.omsNumber = window.__EMIAS_PATIENT__.omsNumber;
         }
 
+        const requestPayload = { ...payload };
+        delete requestPayload.eiToken;
+
+        const reqHeaders = buildRequestHeaders();
+        if (!reqHeaders["EI-Token"]) {
+          console.warn("%c[EMIAS Assistant]%c Внимание: заголовок 'EI-Token' пока не перехвачен! Запрос расписания может завершиться с ошибкой 400. Обновите страницу ЕМИАС или перейдите в раздел записей.", "background:#f59e0b;color:white;font-weight:bold;padding:2px 4px;", "color:#f59e0b;");
+        }
+
         const res = await originalFetch("/api-eip/v4/saOrchestrator/getAvailableResourceScheduleInfo", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          credentials: "include",
+          headers: reqHeaders,
+          body: JSON.stringify(requestPayload)
         });
 
         let data = null;
@@ -292,7 +490,7 @@
 
         if (!res.ok) {
           const errStr = typeof data === "object" ? JSON.stringify(data) : String(data);
-          const payloadStr = JSON.stringify(payload);
+          const payloadStr = JSON.stringify(requestPayload);
           console.error("%c[EMIAS 400 REASON]:%c " + errStr, "background:#dc2626;color:white;font-weight:bold;padding:2px 4px;", "color:#dc2626;font-weight:bold;");
           console.error("%c[EMIAS SENT PAYLOAD]:%c " + payloadStr, "background:#475569;color:white;padding:2px 4px;", "color:#334155;");
         }
@@ -310,6 +508,9 @@
         if (!window.__EMIAS_PATIENT__) {
           scanStorageForPatient();
         }
+        if (payload.eiToken && !window.__EMIAS_EI_TOKEN__) {
+          window.__EMIAS_EI_TOKEN__ = payload.eiToken;
+        }
         if ((!payload.birthDate || payload.birthDate === "undefined" || payload.birthDate.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
           payload.birthDate = window.__EMIAS_PATIENT__.birthDate;
         }
@@ -317,10 +518,16 @@
           payload.omsNumber = window.__EMIAS_PATIENT__.omsNumber;
         }
 
+        const requestPayload = { ...payload };
+        delete requestPayload.eiToken;
+
+        const reqHeaders = buildRequestHeaders();
+
         const res = await originalFetch("/api-eip/v4/saOrchestrator/shiftAppointment", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          credentials: "include",
+          headers: reqHeaders,
+          body: JSON.stringify(requestPayload)
         });
         let data = null;
         try {
@@ -330,7 +537,7 @@
         }
 
         if (!res.ok) {
-          console.error("%c[EMIAS SHIFT FAILED]:%c", "background:#dc2626;color:white;font-weight:bold;padding:2px 4px;", "color:#dc2626;font-weight:bold;", data, payload);
+          console.error("%c[EMIAS SHIFT FAILED]:%c", "background:#dc2626;color:white;font-weight:bold;padding:2px 4px;", "color:#dc2626;font-weight:bold;", data, requestPayload);
         }
 
         window.postMessage({
@@ -345,6 +552,9 @@
         if (!window.__EMIAS_PATIENT__) {
           scanStorageForPatient();
         }
+        if (payload.eiToken && !window.__EMIAS_EI_TOKEN__) {
+          window.__EMIAS_EI_TOKEN__ = payload.eiToken;
+        }
         if ((!payload.birthDate || payload.birthDate === "undefined" || payload.birthDate.includes("REDACTED")) && window.__EMIAS_PATIENT__) {
           payload.birthDate = window.__EMIAS_PATIENT__.birthDate;
         }
@@ -352,10 +562,16 @@
           payload.omsNumber = window.__EMIAS_PATIENT__.omsNumber;
         }
 
+        const requestPayload = { ...payload };
+        delete requestPayload.eiToken;
+
+        const reqHeaders = buildRequestHeaders();
+
         const res = await originalFetch("/api-eip/v10/saOrchestrator/getAppointmentReceptionsByPatient", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          credentials: "include",
+          headers: reqHeaders,
+          body: JSON.stringify(requestPayload)
         });
         const data = await res.json();
         window.postMessage({
